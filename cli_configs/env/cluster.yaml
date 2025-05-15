@@ -1,0 +1,8 @@
+# @package _global_
+exp_dir: '/dkfz/cluster/gpu/checkpoints/OE0441/c306h/classification/experiments/'
+data_dir: '/dkfz/cluster/gpu/data/OE0441/c306h/ssl3d_data/classification/preprocessed/'
+
+trainer:
+  enable_progress_bar: False
+  callbacks:
+    progressbar: ~
