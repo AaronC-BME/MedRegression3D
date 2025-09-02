@@ -116,6 +116,15 @@ Training from scratch:
 
 `python main.py env=cluster model=resenc data=Datasetname trainer.devices=1  model.pretrained=False`
 
+### ResEnc-L - Regression
+Fine-tuning:
+
+`python main.py env=cluster model=resenc_ord_reg data=Datasetname  trainer.devices=1 model.pretrained=True  model.chpt_path=<path/to/checkpoint>`
+
+Training from scratch:
+
+`python main.py env=cluster model=resenc_ord_reg data=Datasetname trainer.devices=1  model.pretrained=False`
+
 
 
 **If you use this codebase, please cite:**
