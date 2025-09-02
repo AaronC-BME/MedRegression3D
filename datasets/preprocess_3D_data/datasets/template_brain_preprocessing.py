@@ -6,9 +6,11 @@ import glob
 import numpy as np
 from multiprocessing import Pool
 from functools import partial
+import os
 
 from datasets.preprocess_3D_data.blosc_helper import save_case, comp_blosc2_params
 from batchgenerators.utilities.file_and_folder_operations import *
+from batchgenerators.utilities.file_and_folder_operations import load_json
 
 from datasets.preprocess_3D_data.preprocess_dataset import preprocess_dataset_tospacing
 
@@ -22,7 +24,7 @@ def process_and_save_all_cases(
 ):
     os.makedirs(out_dir, exist_ok=True)
 
-    t1_paths = sorted(glob.glob(os.path.join(image_dir, "*_MR_pseudo_ax_km.nii.gz")))
+    t1_paths = sorted(glob.glob(os.path.join(image_dir, "*.nii.gz")))
     image_ids = [p.split('/')[-1][:8] for p in t1_paths]
 
     with Pool(processes=num_workers) as pool:
@@ -98,29 +100,30 @@ if __name__ == '__main__':
     
     
     '''
-    nii_files = []
-    unique_ids = []
-    label_dict = {} # {'unique_id1': 1, ...}
+    dataset_base = '/bdm-das/ADSP_v1/nnssl_dataset/ukbb_dataset/nnUNetResEncUNetLPlans_3d_fullres'
+    nii_files = glob.glob(os.path.join(dataset_base, '*.nii.gz'))
+    unique_ids = [os.path.basename(f).split('_')[0] for f in nii_files]
+    label_dict = load_json('/bdm-das/ADSP_v1/nnssl_dataset/ukbb_dataset/labelsTr.json') # {'unique_id1': 1, ...}
 
 
 
     ###############resampling to 1mm spacing - uncomment!######################
-    #preprocess_dataset_tospacing(nii_files, unique_ids, label_dict, [1.,1.,1.], out_folder='/home/c306h/cluster-data/ssl3d_data/classification/raw/rec_vs_t_1mm',  num_worker=12)
+    preprocess_dataset_tospacing(nii_files, unique_ids, label_dict, [1.,1.,1.], out_folder='/bdm-das/ADSP_v1/nnssl_dataset/ukbb_dataset/preprocess_data/to_spacing',  num_worker=12)
 
     ###########use hdbet to find brain center ##########
     ###########hd-bet -i imagepath -o outpath --save_bet_mask --no_bet_image######
 
     ###########last step: copy files, crop and save images#####################
-    # image_dir = '/home/c306h/cluster-data/ssl3d_data/classification/raw/rec_vs_t_1mm'
-    # mask_dir = "/home/c306h/cluster-data/ssl3d_data/classification/raw/rec_vs_t_1mm/masks"
-    # out_dir = "/home/c306h/cluster-data/ssl3d_data/classification/preprocessed/rec_vs_t_1mm_cropped_160"
-    # maybe_mkdir_p(out_dir)
-    # shutil.copy(join(image_dir, 'labels.json'), join(out_dir, 'labels.json'))
-    # shutil.copy(join(image_dir, 'splits.json'), join(out_dir, 'splits.json'))
-    #
-    # process_and_save_all_cases(
-    #     image_dir=image_dir,
-    #     mask_dir=mask_dir,
-    #     out_dir=out_dir,
-    #     target_shape=(160, 160, 160), #we use a 160pix patchsize for the pre-training
-    #     num_workers=12)  # Adjust for your system
+    image_dir = '/bdm-das/ADSP_v1/nnssl_dataset/ukbb_dataset/preprocess_data/to_spacing'
+    mask_dir = "/bdm-das/ADSP_v1/nnssl_dataset/ukbb_dataset/preprocess_data/to_spacing/masks"
+    out_dir = "/bdm-das/ADSP_v1/nnssl_dataset/ukbb_dataset/preprocess_data/to_spacing_cropped"
+    maybe_mkdir_p(out_dir)
+    shutil.copy(join(image_dir, 'labels.json'), join(out_dir, 'labels.json'))
+    shutil.copy(join(image_dir, 'splits.json'), join(out_dir, 'splits.json'))
+    
+    process_and_save_all_cases(
+        image_dir=image_dir,
+        mask_dir=mask_dir,
+        out_dir=out_dir,
+        target_shape=(160, 160, 160), #we use a 160pix patchsize for the pre-training
+        num_workers=12)  # Adjust for your system

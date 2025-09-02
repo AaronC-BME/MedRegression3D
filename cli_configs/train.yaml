@@ -81,12 +81,17 @@ trainer:
     checkpoint:
       _target_: lightning.pytorch.callbacks.ModelCheckpoint
       dirpath: ???
-      filename: '{epoch}-{val_loss:.2f}'
-      auto_insert_metric_name: True
+      filename: 'epoch{epoch}-Val_loss={Val/loss:.2f}-Val_mae={Val/MAE:.2f}'
+      auto_insert_metric_name: False
+      monitor: 'Val/MAE'              
+      mode: 'min'                
+      save_top_k: 5              
+      save_last: true           
+      save_weights_only: false  
   devices: 1
   accelerator: 'gpu'
   sync_batchnorm: False  # set to True if you use multiple GPUs
-  enable_checkpointing: False
+  enable_checkpointing: True
   max_epochs: 200
   benchmark: True
   deterministic: False
@@ -106,4 +111,4 @@ trainer:
   #limit_val_batches: 0.5
   #limit_test_batches: 0.25
   #gradient_clip_val: 0.5
-  #log_every_n_steps: 50
+  log_every_n_steps: 50

@@ -266,3 +266,32 @@ def get_validation_transforms(
             DownsampleSegForDSTransform(ds_scales=deep_supervision_scales)
         )
     return ComposeTransforms(transforms)
+
+@staticmethod
+def get_test_transforms(
+    patch_size: Union[np.ndarray, Tuple[int]],
+    do_dummy_2d_data_aug: bool = False,
+) -> BasicTransform:
+    transforms = []
+
+    if do_dummy_2d_data_aug:
+        transforms.append(Convert3DTo2DTransform())
+        patch_size_spatial = patch_size[1:]
+    else:
+        patch_size_spatial = patch_size
+
+    transforms.append(
+        SpatialTransform(
+            patch_size=patch_size_spatial,
+            patch_center_dist_from_border=0,
+            random_crop=False,
+            p_elastic_deform=0.0,
+            p_rotation=0.0,
+            p_scaling=0.0,
+        )
+    )
+
+    if do_dummy_2d_data_aug:
+        transforms.append(Convert2DTo3DTransform())
+
+    return ComposeTransforms(transforms)

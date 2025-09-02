@@ -97,6 +97,7 @@ class BaseDataModule(LightningDataModule):
         return testloader
 
     def predict_dataloader(self):
+        print(f"[INFO] Predicting on {len(self.test_dataset)} test samples.")
         predictloader = DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,

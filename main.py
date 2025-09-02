@@ -9,8 +9,8 @@ from omegaconf import OmegaConf
 import torch
 
 from parsing_utils import make_omegaconf_resolvers
-
-
+# python main.py env=local model=primus data=smartbrain  trainer.devices=1 model.pretrained=False
+# python main.py env=cluster model=resenc data=age_ord_reg  trainer.devices=1 model.pretrained=False
 @hydra.main(version_base=None, config_path="./cli_configs", config_name="train")
 def main(cfg):
 
@@ -72,6 +72,11 @@ def main(cfg):
         # instantiate trainer, model and dataset
         trainer = instantiate(cfg.trainer)
         model = instantiate(cfg.model)
+        
+        #check which part of the model is trainable
+        # for name, p in model.named_parameters():
+        #     print(name, p.requires_grad)
+
         if cfg.model.compile:
             model = torch.compile(model, mode="default")
         dataset = instantiate(cfg.data).module
@@ -113,7 +118,7 @@ def main(cfg):
         if cfg_dict["val_only"]:
             trainer.validate(model, dataset)
         else:
-            trainer.fit(model, dataset)
+            trainer.fit(model, dataset, ckpt_path=cfg.get("ckpt_path", None))
 
         wandb.finish()
 

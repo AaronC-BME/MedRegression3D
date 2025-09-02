@@ -14,6 +14,7 @@ from einops import rearrange
 from peft import get_peft_model, LoraConfig, TaskType
 from base_model import BaseModel
 from models.classification_head import ClassificationHead
+from models.ordinal_regression_head import OrdinalRegressionHead
 from batchgenerators.utilities.file_and_folder_operations import join, load_json, isfile
 
 
@@ -178,6 +179,117 @@ class Eva_MAE(BaseModel):
         x = self.cls_head(x)
 
         return x
+
+class Eva_MAE_OrdinalRegressor(BaseModel):
+    def __init__(
+        self,
+        embed_dim,
+        patch_embed_size,
+        input_shape,
+        depth,
+        num_heads,
+        num_reg_tokens,
+        use_rot_pos_emb,
+        use_abs_pos_emb,
+        mlp_ratio,
+        drop_path_rate,
+        drop_path_scale,
+        patch_drop_rate,
+        proj_drop_rate,
+        attn_drop_rate,
+        rope_kwargs,
+        chpt_path,
+        **hypparams,
+    ):
+        super(Eva_MAE_OrdinalRegressor, self).__init__(**hypparams)
+
+        self.eva_encoder = EvaEncoder(
+            embed_dim,
+            patch_embed_size,
+            input_shape,
+            depth,
+            num_heads,
+            num_reg_tokens,
+            use_rot_pos_emb,
+            use_abs_pos_emb,
+            mlp_ratio,
+            drop_path_rate,
+            drop_path_scale,
+            patch_drop_rate,
+            proj_drop_rate,
+            attn_drop_rate,
+            rope_kwargs,
+            chpt_path,
+            **hypparams,
+        )
+
+        if self.pretrained:
+            self.eva_encoder = load_pretrained_weights(
+                self.eva_encoder,
+                chpt_path,
+                handle_input_shape_mismatch=hypparams[
+                    "pretraining_input_shape_mismatch"
+                ],
+                load_cls_token=hypparams["load_cls_token"],
+                input_shape=input_shape,
+                patch_embed_size=patch_embed_size
+
+            )
+
+            if hypparams["finetune_method"] == "full":
+                pass
+
+            elif hypparams["finetune_method"] == "linear_probing":
+                # fully freeze encoder
+                for n, param in self.eva_encoder.named_parameters():
+
+                    if not hypparams["load_cls_token"] and "cls_token" in n:
+                        param.requires_grad = True  # make cls_token trainable if it's not loaded from pretrained weights
+                    else:
+                        param.requires_grad = False
+
+            elif hypparams["finetune_method"] == "lora":
+                # Apply LoRA to attention layers
+
+                lora_config = LoraConfig(
+                    # task_type=TaskType.IMAGE_CLASSIFICATION,
+                    r=8,  # LoRA rank
+                    lora_alpha=32,  # Scaling factor
+                    lora_dropout=0.1,
+                    target_modules=["attn.qkv", "attn.proj"],
+                )
+
+                self.eva_encoder.eva = get_peft_model(self.eva_encoder.eva, lora_config)
+
+                # Freeze all layers except LoRA-adapted ones
+                for param in self.eva_encoder.parameters():
+                    param.requires_grad = False
+
+                for name, param in self.eva_encoder.eva.named_parameters():
+                    if "lora" in name:
+                        param.requires_grad = True
+
+            else:
+                raise NotImplementedError
+            
+        with torch.no_grad():
+            dummy_input = torch.randn(1, hypparams["input_channels"], *input_shape).to("cuda")
+            dummy_features = self.eva_encoder(dummy_input)
+            actual_embed_dim = dummy_features.shape[-1]
+
+        self.reg_head = OrdinalRegressionHead(
+            embed_dim=actual_embed_dim,
+            num_classes=hypparams["num_classes"],
+            dropout=hypparams.get("classification_head_dropout", 0.1),
+            patch_aggregation_method=hypparams.get("token_aggregation_method", "avg"),
+            cls_token_available=False,
+        )
+
+    def forward(self, x):
+        x = self.eva_encoder(x)
+        logits, probas = self.reg_head(x)
+
+        return logits, probas
 
 
 def load_pretrained_weights(

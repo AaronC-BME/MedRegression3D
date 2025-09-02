@@ -7,6 +7,15 @@ import torch.distributed as dist
 
 from base_model import BaseModel
 from models.classification_head import ClassificationHead
+from models.ordinal_regression_head import OrdinalRegressionHead, OrdinalRegressionHead_MLP  # <-- use your new head
+
+
+def get_first_valid_key(d, keys):
+    for k in keys:
+        if k in d:
+            return d[k]
+    raise KeyError(f"None of the specified keys found: {keys}")
+
 
 
 class ResEncoder(Module):
@@ -86,6 +95,79 @@ class ResEncoder_Classifier(BaseModel):
 
         return x
 
+class ResEncoder_OrdinalRegressor(BaseModel):
+    def __init__(self, **hypparams):
+        super().__init__(**hypparams)
+
+        self.encoder = ResEncoder(**hypparams)
+
+        # Number of ordinal thresholds is (num_classes - 1)
+        self.reg_head = OrdinalRegressionHead(
+            embed_dim=320,
+            num_classes=hypparams["num_classes"],
+            dropout=hypparams.get("classification_head_dropout", 0.1),
+            patch_aggregation_method=hypparams.get("token_aggregation_method", "avg"),
+            cls_token_available=False,
+        )
+
+        # ✅ Only load reg_head if weights are available
+        if hypparams.get("pretrained", False):
+            ckpt = torch.load(hypparams["chpt_path"], map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt)
+
+            loaded_keys = []
+            for name, param in state_dict.items():
+                if name.startswith("reg_head") and name in self.state_dict():
+                    if self.state_dict()[name].shape == param.shape:
+                        self.state_dict()[name].copy_(param)
+                        loaded_keys.append(name)
+
+            # if loaded_keys:
+            #     print(f"✅ reg_head weights loaded: {len(loaded_keys)} params")
+            # else:
+            #     print("⚠️ No reg_head weights found in checkpoint — randomly initialized.")
+
+    def forward(self, x):
+        x = self.encoder(x)
+        logits, probas = self.reg_head(x)
+        return logits, probas
+
+class ResEncoder_OrdinalRegressor_MLP(BaseModel):
+    def __init__(self, **hypparams):
+        super().__init__(**hypparams)
+
+        self.encoder = ResEncoder(**hypparams)
+
+        # Number of ordinal thresholds is (num_classes - 1)
+        self.reg_head = OrdinalRegressionHead_MLP(
+            embed_dim=320,
+            num_classes=hypparams["num_classes"],
+            dropout=hypparams.get("classification_head_dropout", 0.1),
+            patch_aggregation_method=hypparams.get("token_aggregation_method", "avg"),
+            cls_token_available=False,
+        )
+
+        # # ✅ Only load reg_head if weights are available
+        # if hypparams.get("pretrained", False):
+        #     ckpt = torch.load(hypparams["chpt_path"], map_location="cpu")
+        #     state_dict = ckpt.get("state_dict", ckpt)
+
+        #     loaded_keys = []
+        #     for name, param in state_dict.items():
+        #         if name.startswith("reg_head") and name in self.state_dict():
+        #             if self.state_dict()[name].shape == param.shape:
+        #                 self.state_dict()[name].copy_(param)
+        #                 loaded_keys.append(name)
+
+        #     if loaded_keys:
+        #         print(f"✅ reg_head weights loaded: {len(loaded_keys)} params")
+        #     else:
+        #         print("⚠️ No reg_head weights found in checkpoint — randomly initialized.")
+
+    def forward(self, x):
+        x = self.encoder(x)
+        logits, probas = self.reg_head(x)
+        return logits, probas
 
 def load_pretrained_weights(
     resenc_model,
@@ -99,7 +181,15 @@ def load_pretrained_weights(
         )
     else:
         saved_model = torch.load(pretrained_weights_file, weights_only=False)
-    pretrained_dict = saved_model["network_weights"]
+    if 'network_weights' in saved_model:
+        # print("Loaded weights from 'network_weights'")
+        pretrained_dict = saved_model['network_weights']
+    elif 'state_dict' in saved_model:
+        # print("Loaded weights from 'state_dict'")
+        pretrained_dict = saved_model['state_dict']
+    else:
+        raise KeyError("No compatible weight dictionary ('network_weights' or 'state_dict') found in checkpoint")
+
 
     if isinstance(resenc_model, DDP):
         mod = resenc_model.module
@@ -110,12 +200,16 @@ def load_pretrained_weights(
 
     model_dict = mod.state_dict()
 
-    in_conv_weights_model: torch.Tensor = model_dict[
-        "encoder.stem.convs.0.all_modules.0.weight"
-    ]
-    in_conv_weights_pretrained: torch.Tensor = pretrained_dict[
-        "encoder.stem.convs.0.all_modules.0.weight"
-    ]
+    in_conv_weights_model = get_first_valid_key(model_dict, [
+        "encoder.stem.convs.0.all_modules.0.weight",
+        "encoder.res_unet.encoder.stem.convs.0.all_modules.0.weight"
+    ])
+
+    in_conv_weights_pretrained = get_first_valid_key(pretrained_dict, [
+        "encoder.stem.convs.0.all_modules.0.weight",
+        "encoder.res_unet.encoder.stem.convs.0.all_modules.0.weight"
+    ])
+
 
     in_channels_model = in_conv_weights_model.shape[1]
     in_channels_pretrained = in_conv_weights_pretrained.shape[1]

@@ -101,3 +101,14 @@ datasets/GLvsL_1mm_cropped_160.py
 datasets/imagenet_resize.py
 
 !cli_configs/*
+
+# Training artifacts
+wandb/
+logs/
+outputs/
+runs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.tar.gz

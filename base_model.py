@@ -25,7 +25,10 @@ from metrics.balanced_accuracy import BalancedAccuracy
 from augmentation.mixup import mixup_criterion, mixup_data
 from metrics.conf_mat import ConfusionMatrix
 from regularization.sam import SAM
-
+from losses.coral_loss import coral_loss, label_to_levels
+from functools import partial
+import os
+import numpy as np
 
 class BaseModel(L.LightningModule):
     def __init__(
@@ -72,13 +75,14 @@ class BaseModel(L.LightningModule):
         metrics_dict = {}
 
         self.subtask = kwargs["subtask"]
+        # print(f"[DEBUG] Subtask: {self.subtask}")
 
         if self.subtask == "multiclass":
             metric_task = "multiclass"
         elif self.subtask == "multilabel":
             metric_task = "multilabel"
 
-        if self.task == "Classification":
+        if "Classification" in self.task:
             if "acc" in metrics:
                 metrics_dict["Accuracy"] = Accuracy(
                     task=metric_task,
@@ -86,11 +90,10 @@ class BaseModel(L.LightningModule):
                     num_labels=num_classes,
                 )
             if "balanced_acc" in metrics:
-                if "balanced_acc" in metrics:
-                    metrics_dict["Balanced_Accuracy"] = BalancedAccuracy(
-                        task=metric_task,
-                        num_classes=num_classes,
-                    )
+                metrics_dict["Balanced_Accuracy"] = BalancedAccuracy(
+                    task=metric_task,
+                    num_classes=num_classes,
+                )
 
             if "f1" in metrics:
                 metrics_dict["F1"] = F1Score(
@@ -140,22 +143,22 @@ class BaseModel(L.LightningModule):
                     num_labels=num_classes,
                 )
 
-        elif self.task == "Regression":
+        elif self.task.startswith("Ordinal_Regression") or self.task == "Regression":
             if "mse" in metrics:
                 metrics_dict["MSE"] = MeanSquaredError()
             if "mae" in metrics:
                 metrics_dict["MAE"] = MeanAbsoluteError()
 
         if self.result_plot_setting in ["val", "all"]:
-            if self.task == "Classification":
+            if "Classification" in self.task:
                 self.val_conf_mat = ConfusionMatrix(num_classes=num_classes)
-            elif self.task == "Regression":
+            elif self.task.startswith("Ordinal_Regression") or self.task == "Regression":
                 self.val_pred_list = []
                 self.val_label_list = []
         if self.result_plot_setting == "all":
-            if self.task == "Classification":
+            if "Classification" in self.task:
                 self.train_conf_mat = ConfusionMatrix(num_classes=num_classes)
-            elif self.task == "Regression":
+            elif self.task.startswith("Ordinal_Regression") or self.task == "Regression":
                 self.train_pred_list = []
                 self.train_label_list = []
 
@@ -218,22 +221,87 @@ class BaseModel(L.LightningModule):
                 )
             elif self.subtask == "multilabel":
                 self.criterion = nn.BCEWithLogitsLoss()
+        elif self.task == "Classification_Focal_Loss":
+            from losses.cls_loss import FocalLoss
+            print("Using Focal loss for Classification")
+            self.criterion = FocalLoss()
+        elif self.task == "Classification_Topk10_Loss":
+            from losses.cls_loss import TopKLoss
+            print("Using Topk10 loss for Classification")
+            self.criterion = TopKLoss()
         elif self.task == "Regression":
             self.criterion = nn.MSELoss()
+        elif self.task == "Ordinal_Regression":
+            self.criterion = coral_loss
+        elif self.task == "Ordinal_Regression_Focal_Loss":
+            from losses.coral_loss import coral_focal_loss
+            print("Using Coral Focal Loss (Gamma=3.0) for Ordinal Regression")
+            self.criterion = partial(coral_focal_loss, gamma=3.0)
+        elif self.task == "Ordinal_Regression_TopK10Loss":
+            from losses.coral_loss import coral_topk_loss
+            print("Using Coral TopK10 Loss for Ordinal Regression")
+            self.criterion = coral_topk_loss
+        elif self.task == "Ordinal_Regression_TopK20Loss":
+            from losses.coral_loss import coral_topk_loss
+            print("Using Coral TopK20 Loss for Ordinal Regression")
+            self.criterion = partial(coral_topk_loss, k=20)
+        elif self.task == "Ordinal_Regression_BCE_Focal_Loss":
+            from losses.coral_loss import combined_bce_focal_loss
+            print("Using Combined BCE and Focal Loss (Gamma=3.0) for Ordinal Regression")
+            self.criterion = partial(combined_bce_focal_loss, gamma=3.0)
+        elif self.task == "Ordinal_Regression_BCE_TopK10Loss":
+            from losses.coral_loss import combined_bce_topk_loss
+            print("Using Combined BCE and TopK10 Loss for Ordinal Regression")
+            self.criterion = combined_bce_topk_loss
+        elif self.task == "Ordinal_Regression_BCE_TopK20Loss":
+            from losses.coral_loss import combined_bce_topk_loss
+            print("Using Combined BCE and TopK20 Loss for Ordinal Regression")
+            self.criterion = partial(combined_bce_topk_loss, topk=20)
+        elif self.task == "Ordinal_Regression_Weighted_BCE":
+            print("Using Weighted BCE Loss for Ordinal Regression")
+            self.criterion = coral_loss  # defer weight passing to training_step
+        elif self.task == "Ordinal_Regression_BCE+MAE_Loss":
+            from losses.coral_loss import combined_coral_mae_loss
+            print("Using BCE Loss and MAE (L1) Loss for Ordinal Regression")
+            self.criterion = combined_coral_mae_loss
+        else:
+            raise ValueError(f"Unknown ordinal regression loss: {self.task}")
 
     def forward(self, x):
         pass
 
+    def setup(self, stage=None):
+        self.level_weights = None
+
+        if "Weighted_BCE" in self.task:
+            print("Setting up level weights for Ordinal Regression Weighted BCE")
+            self.level_weights = self.trainer.datamodule.level_weights.to(self.device)
+
     def training_step(self, batch, batch_idx):
 
-        x, y = batch
+        x, y = batch #, subjectID
+
+        # Save input tensors for inspection during first epoch, first batch, on rank 0 only
+        # if self.global_rank == 0 and self.current_epoch == 0 and batch_idx == 0:
+        #     debug_dir = os.path.join(self.logger.save_dir if hasattr(self, "logger") else ".", "debug_inputs")
+        #     os.makedirs(debug_dir, exist_ok=True)
+        #     for i in range(x.shape[0]):
+        #         case_id = subjectID[i]
+        #         npy_path = os.path.join(debug_dir, f"{case_id}.npy")
+        #         np.save(npy_path, x[i].cpu().numpy())
 
         if self.mixup:
             inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=self.mixup_alpha)
             y_hat = self(inputs)
-
+        elif self.task.startswith("Ordinal_Regression"):
+            out = self(x)
+            if isinstance(out, tuple):
+                y_hat = out[0]
+            else:
+                y_hat = out
         else:
             y_hat = self(x)
+
             if self.num_classes == 1:
                 y_hat = y_hat.view(-1)
 
@@ -270,9 +338,18 @@ class BaseModel(L.LightningModule):
             if self.mixup:
                 loss = mixup_criterion(self.criterion, y_hat, targets_a, targets_b, lam)
             else:
-                loss = self.criterion(
-                    y_hat, y.float() if self.subtask == "multilabel" else y
-                )
+                if self.task.startswith("Ordinal_Regression"):
+                    levels = label_to_levels(y, self.num_classes)
+                    if self.task == "Ordinal_Regression_BCE+MAE_Loss":
+                        loss = self.criterion(y_hat, levels, y, importance_weights=self.level_weights)
+                    elif "Weighted" in self.task:
+                        loss = self.criterion(y_hat, levels, importance_weights=sample_weights)
+                    else:
+                        loss = self.criterion(y_hat, levels)
+                else:
+                    loss = self.criterion(
+                        y_hat, y.float() if self.subtask == "multilabel" else y.long()
+                    )
 
         self.log(
             "Train/loss",
@@ -303,13 +380,16 @@ class BaseModel(L.LightningModule):
                 sync_dist=True,
             )
         elif self.metric_computation_mode == "epochwise":
-            if self.task == "Classification":
+            if "Classification" in self.task:
                 if self.subtask == "multilabel":
                     self.train_metrics.update(torch.sigmoid(y_hat.detach()), y)
                 elif self.subtask == "multiclass":
                     self.train_metrics.update(F.softmax(y_hat.detach(), dim=-1), y)
+            elif self.task.startswith("Ordinal_Regression"):
+                pred_classes = (torch.sigmoid(y_hat.detach()) > 0.5).int().sum(dim=1)
+                self.train_metrics.update(pred_classes, y)
             else:
-                self.train_metrics.update(y_hat.detach(), y)
+                self.train_metrics.update(y_hat.view(-1).detach(), y.view(-1))
 
         if hasattr(self, "train_conf_mat"):
             self.train_conf_mat.update(y_hat, y)
@@ -321,14 +401,31 @@ class BaseModel(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        y_hat = self(x)
+        if self.task.startswith("Ordinal_Regression"):
+            out = self(x)
+            if isinstance(out, tuple):
+                y_hat = out[0]
+            else:
+                y_hat = out
+        else:
+            y_hat = self(x)
 
         if self.num_classes == 1:
             y_hat = y_hat.view(-1)
 
-        val_loss = self.criterion(
-            y_hat, y.float() if self.subtask == "multilabel" else y
-        )
+        if self.task.startswith("Ordinal_Regression"):
+            levels = label_to_levels(y, self.num_classes)
+            if self.task == "Ordinal_Regression_BCE+MAE_Loss":
+                val_loss = self.criterion(y_hat, levels, y, importance_weights=self.level_weights)
+            elif "Weighted" in self.task:
+                val_loss = self.criterion(y_hat, levels, importance_weights=sample_weights)
+            else:
+                val_loss = self.criterion(y_hat, levels)
+        else:
+            val_loss = self.criterion(
+                y_hat, y.float() if self.subtask == "multilabel" else y.long()
+            )
+
         self.log(
             "Val/loss",
             val_loss,
@@ -355,11 +452,14 @@ class BaseModel(L.LightningModule):
                 sync_dist=True,  # True if self.trainer.num_devices > 1 else False,
             )
         elif self.metric_computation_mode == "epochwise":
-            if self.task == "Classification":
+            if "Classification" in self.task:
                 if self.subtask == "multilabel":
                     self.val_metrics.update(torch.sigmoid(y_hat.detach()), y)
                 elif self.subtask == "multiclass":
                     self.val_metrics.update(F.softmax(y_hat.detach(), dim=-1), y)
+            elif self.task.startswith("Ordinal_Regression"):
+                pred_classes = (torch.sigmoid(y_hat.detach()) > 0.5).int().sum(dim=1)
+                self.val_metrics.update(pred_classes, y)
             else:
                 self.val_metrics.update(y_hat.detach(), y)
 
@@ -448,9 +548,26 @@ class BaseModel(L.LightningModule):
                             )
                         }
                     )
+                elif self.task.startswith("Ordinal_Regression"):
+                    # expected_ages = torch.sum(torch.sigmoid(preds_all), dim=1)
+                    binary_preds = (torch.sigmoid(preds_all) > 0.5).int()
+                    expected_ages = binary_preds.sum(dim=1)
+                    data = [[x, y] for (x, y) in zip(labels_all, expected_ages)]
+                    table = wandb.Table(
+                        data=data, columns=["Ground Truth", "Prediction"]
+                    )
+                    wandb.log({
+                        "Val Scatterplot": wandb.plot.scatter(
+                            table,
+                            "Ground Truth",
+                            "Prediction",
+                            "Validation Scatterplot",
+                        )
+                    })
+                    
                 if self.save_preds:
 
-                    if self.task == "Classification":
+                    if "Classification" in self.task:
                         columns = (
                                       (["GT_" + str(i) for i in range(len(labels_all[0]))])
                                       if self.subtask == "multilabel"
@@ -469,6 +586,26 @@ class BaseModel(L.LightningModule):
                         ]
                         table = wandb.Table(data=data, columns=columns)
                         wandb.log({"Val Predictions": table})
+                    
+                    elif self.task == "Regression":
+                        columns = ["GT", "Pred"]
+                        data = [
+                            [x.item(), y.item()]
+                            for x, y in zip(labels_all, preds_all)
+                        ]
+                        table = wandb.Table(data=data, columns=columns)
+                        wandb.log({"Val Predictions": table})
+                    
+                    elif self.task.startswith("Ordinal_Regression"):
+                        # Convert logits to expected age
+                        # expected_ages = torch.sum(torch.sigmoid(preds_all), dim=1)
+                        binary_preds = (torch.sigmoid(preds_all) > 0.5).int()
+                        expected_ages = binary_preds.sum(dim=1)
+                        columns = ["GT", "Pred"]
+                        data = [[x.item(), y.item()] for x, y in zip(labels_all, expected_ages)]
+                        table = wandb.Table(data=data, columns=columns)
+                        wandb.log({"Val Predictions": table})
+
                     else:
                         raise NotImplementedError
 
@@ -592,12 +729,18 @@ class BaseModel(L.LightningModule):
             # Separate encoder and cls_head parameters
             encoder_params = []
             cls_head_params = []
+            reg_head_params = []
 
             for name, param in self.named_parameters():
                 if "encoder" in name:
                     encoder_params.append(param)
                 elif "cls_head" in name:
                     cls_head_params.append(param)
+                elif "reg_head" in name:
+                    reg_head_params.append(param)
+        
+            head_params = cls_head_params if len(cls_head_params) > 0 else reg_head_params
+            head_name = "cls_head" if len(cls_head_params) > 0 else "reg_head"
 
         if not self.sam:
             if self.optimizer == "SGD":
@@ -605,12 +748,12 @@ class BaseModel(L.LightningModule):
                     optimizer = torch.optim.SGD(
                         [
                             {
-                                "params": cls_head_params,
+                                "params": head_params,
                                 "lr": self.lr,
                                 "momentum": 0.9,
                                 "weight_decay": self.weight_decay,
                                 "nesterov": self.nesterov,
-                                "name": "cls_head",
+                                "name": head_name,
                             },
                             {
                                 "params": encoder_params,
@@ -636,10 +779,10 @@ class BaseModel(L.LightningModule):
                     optimizer = torch.optim.Adam(
                         [
                             {
-                                "params": cls_head_params,
+                                "params": head_params,
                                 "lr": self.lr,
                                 "weight_decay": self.weight_decay,
-                                "name": "cls_head",
+                                "name": head_name,
                             },
                             {
                                 "params": encoder_params,
@@ -660,10 +803,10 @@ class BaseModel(L.LightningModule):
                     optimizer = torch.optim.AdamW(
                         [
                             {
-                                "params": cls_head_params,
+                                "params": head_params,
                                 "lr": self.lr,
                                 "weight_decay": self.weight_decay,
-                                "name": "cls_head",
+                                "name": head_name,
                             },
                             {
                                 "params": encoder_params,
@@ -684,10 +827,10 @@ class BaseModel(L.LightningModule):
                     optimizer = RMSpropTF(
                         [
                             {
-                                "params": cls_head_params,
+                                "params": head_params,
                                 "lr": self.lr,
                                 "weight_decay": self.weight_decay,
-                                "name": "cls_head",
+                                "name": head_name,
                             },
                             {
                                 "params": encoder_params,
@@ -708,11 +851,11 @@ class BaseModel(L.LightningModule):
                     optimizer = MADGRAD(
                         [
                             {
-                                "params": cls_head_params,
+                                "params": head_params,
                                 "lr": self.lr,
                                 "momentum": 0.9,
                                 "weight_decay": self.weight_decay,
-                                "name": "cls_head",
+                                "name": head_name,
                             },
                             {
                                 "params": encoder_params,
@@ -802,12 +945,14 @@ class BaseModel(L.LightningModule):
                         warmstart1=self.warmstart,
                         warmstart2=self.warmstart2,
                     )
+                    print(f"[INFO] Using CosineAnnealingLR_DoubleWarmstart: warmstart1={self.warmstart}, warmstart2={self.warmstart2}, T_max={self.T_max}")
                 else:
                     scheduler = CosineAnnealingLR_Warmstart(
                         optimizer,
                         T_max=self.T_max,
                         warmstart=self.warmstart,
                     )
+                    print(f"[INFO] Using CosineAnnealingLR_Warmstart: warmstart1={self.warmstart}, T_max={self.T_max}")
             elif self.scheduler == "Step":
                 # decays every 1/4 epochs
                 scheduler = torch.optim.lr_scheduler.StepLR(
@@ -837,7 +982,7 @@ class CosineAnnealingLR_Warmstart(_LRScheduler):
         self.T = 0
 
         super(CosineAnnealingLR_Warmstart, self).__init__(
-            optimizer, last_epoch, verbose
+            optimizer, last_epoch #, verbose
         )
 
     def get_lr(self):
@@ -913,22 +1058,23 @@ class CosineAnnealingLR_DoubleWarmstart(_LRScheduler):
         self.T = 0  # Internal counter
 
         # Identify param groups: assume "cls_head" and "encoder" are named properly in optimizer param_groups
-        self.cls_head_group = None
+        # Identify param groups: support either 'cls_head' or 'reg_head'
+        self.head_group = None
         self.encoder_group = None
 
         for param_group in optimizer.param_groups:
-            if param_group.get("name") == "cls_head":
-                self.cls_head_group = param_group
+            if param_group.get("name") in ["cls_head", "reg_head"]:
+                self.head_group = param_group
             elif param_group.get("name") == "encoder":
                 self.encoder_group = param_group
 
-        if self.cls_head_group is None:
-            raise ValueError("Optimizer must have a parameter group named 'cls_head'.")
+        if self.head_group is None:
+            raise ValueError("Optimizer must have a parameter group named 'cls_head' or 'reg_head'.")
         if self.encoder_group is None:
             raise ValueError("Optimizer must have a parameter group named 'encoder'.")
 
-        super(CosineAnnealingLR_DoubleWarmstart, self).__init__(
-            optimizer, last_epoch, verbose
+        super().__init__(
+            optimizer, last_epoch
         )
 
     def get_lr(self):
@@ -946,7 +1092,7 @@ class CosineAnnealingLR_DoubleWarmstart(_LRScheduler):
             updated_lr = []
 
             for group in self.optimizer.param_groups:
-                if group is self.cls_head_group:
+                if group is self.head_group:
                     updated_lr.append(group["initial_lr"] * warmup_factor)
                 else:  # Keep encoder frozen
                     updated_lr.append(0)

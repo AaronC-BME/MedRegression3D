@@ -1,0 +1,49 @@
+# @package _global_
+data:
+  module:
+    _target_: datasets.AgeReg.AgeReg_DataModule
+    name: AgeReg
+    data_root_dir: /bdm-das/ADSP_v1/nnssl_dataset/nnssl_preprocessed/Dataset001_UKBB # To be changed for each dataset
+    batch_size: 4
+    train_transforms:
+      _target_: augmentation.policies.batchgenerators.get_training_transforms
+      patch_size: ${data.patch_size}
+      rotation_for_DA: 0.523599
+      mirror_axes: [0,1,2]
+      do_dummy_2d_data_aug: False
+    test_transforms: 
+      _target_: augmentation.policies.batchgenerators.get_test_transforms
+      patch_size: ${data.patch_size}
+      do_dummy_2d_data_aug: False
+  cv:
+    k: 1
+
+  num_classes: 1
+  patch_size: [160, 160, 160]
+
+model:
+  task: 'Regression' #'Classification'
+  cifar_size: False
+  input_channels: 1
+  input_dim: 3
+  input_shape: ${data.patch_size}
+  optimizer: AdamW
+  lr: 0.001
+  warmstart: 20
+  weight_decay: 1e-2
+
+
+trainer:
+  logger:
+    project: nnSSL UKBB Age Regression
+  accumulate_grad_batches: 48
+  max_epochs: 200
+  sync_batchnorm: True
+
+metrics:
+  - 'mae' 
+  - 'mse'
+  #'f1'
+  #- 'balanced_acc'
+  #- 'ap'
+  #- 'auroc'
