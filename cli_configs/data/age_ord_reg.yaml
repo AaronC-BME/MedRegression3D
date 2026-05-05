@@ -2,8 +2,8 @@
 data:
   module:
     _target_: datasets.AgeReg.AgeReg_DataModule
-    name: UKBB_ResEnc_Ord_reg
-    data_root_dir: /bdm-das/ADSP_v1/nnssl_dataset/nnssl_preprocessed/Dataset001_UKBB # To be changed for each dataset
+    name: OpenNeuroAgeRegression
+    data_root_dir: /home/jma/Documents/projects/aaron/nnssl_dataset/nnssl_preprocessed/Dataset017_OpenNeuro # To be changed for each dataset
     batch_size: 4
     train_transforms:
       _target_: augmentation.policies.batchgenerators.get_training_transforms
@@ -16,13 +16,14 @@ data:
       patch_size: ${data.patch_size}
       do_dummy_2d_data_aug: False
   cv:
-    k: 1
+    k: 5
 
   num_classes: 100
   patch_size: [160, 160, 160]
 
 model:
   task: 'Ordinal_Regression' #'Classification'
+  loss_fn: null # focal, topk10, topk20, bce_focal, bce_topk10, bce_topk20, weighted_bce, bce_mae
   cifar_size: False
   input_channels: 1
   input_dim: 3
@@ -37,7 +38,8 @@ model:
 
 trainer:
   logger:
-    project: nnSSL UKBB Age Regression
+    project: nnSSL OpenNeuro Age Regression
+    name: QuickTest
   accumulate_grad_batches: 48
   max_epochs: 200
   sync_batchnorm: True

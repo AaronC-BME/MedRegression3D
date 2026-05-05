@@ -1,79 +1,125 @@
-from pathlib import Path
 import os
+from contextlib import suppress
+from pathlib import Path
 
 import hydra
+import torch
 import wandb
 from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from omegaconf import OmegaConf
-import torch
 
 from parsing_utils import make_omegaconf_resolvers
-# python main.py env=local model=primus data=smartbrain  trainer.devices=1 model.pretrained=False
-# python main.py env=cluster model=resenc data=age_ord_reg  trainer.devices=1 model.pretrained=False
-@hydra.main(version_base=None, config_path="./cli_configs", config_name="train")
-def main(cfg):
 
-    # seeding
+
+# Example invocations:
+#   python main.py env=local model=primus data=smartbrain trainer.devices=1 model.pretrained=False
+#   python main.py env=cluster model=resenc_ord_reg data=age_ord_reg trainer.devices=1 model.pretrained=False
+
+
+def _prepare_cfg(cfg):
+    """Top-level cfg mutations done once before the CV loop."""
     if cfg.seed:
         seed_everything(cfg.seed)
         cfg.trainer.benchmark = False
         cfg.trainer.deterministic = True
 
-    # setup logger
-    try:
-        Path(
-            "./main.log"
-        ).unlink()  # gets automatically created, however logs are available in Weights and Biases so we do not need to log twice
-    except:
-        pass
+    # main.log gets auto-created by Hydra; remove it so we don't keep two logs
+    # (W&B already captures everything).
+    with suppress(FileNotFoundError):
+        Path("./main.log").unlink()
+
     log_path = Path(cfg.trainer.logger.save_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
     uid = cfg.output_subdir.split("/")[-1]
     cfg.trainer.logger.group = uid
 
-    # add sync_batchnorm if multiple GPUs are used
+    # Sync BN across GPUs when training on multiple devices
     if cfg.trainer.devices > 1 and cfg.trainer.accelerator == "gpu":
         cfg.trainer.sync_batchnorm = True
 
-    # remove callbacks that are not enabled
-    cfg.trainer.callbacks = [i for i in cfg.trainer.callbacks.values() if i]
+    # Filter callbacks: drop any that are None/disabled, and drop ModelCheckpoint
+    # if checkpointing is off.
+    cfg.trainer.callbacks = [c for c in cfg.trainer.callbacks.values() if c]
     if not cfg.trainer["enable_checkpointing"]:
         cfg.trainer.callbacks = [
-            i
-            for i in cfg.trainer.callbacks
-            if i["_target_"] != "lightning.pytorch.callbacks.ModelCheckpoint"
+            c for c in cfg.trainer.callbacks
+            if c["_target_"] != "lightning.pytorch.callbacks.ModelCheckpoint"
         ]
 
+    return uid
+
+
+def _set_checkpoint_dir(cfg, uid):
+    """Point ModelCheckpoint at <exp_dir>/<dataset>/checkpoints/<uid>/<fold>."""
+    if not cfg.trainer["enable_checkpointing"]:
+        return
+    for cb in cfg.trainer.callbacks:
+        if cb["_target_"] == "lightning.pytorch.callbacks.ModelCheckpoint":
+            cb["dirpath"] = os.path.join(
+                str(cfg.exp_dir),
+                str(cfg.data.module.name),
+                "checkpoints",
+                uid,
+                str(cfg.data.module.fold),
+            )
+
+
+def _log_hyperparams(trainer, cfg):
+    """Strip non-loggable fields and forward the rest to the logger."""
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+
+    # Model
+    cfg_dict["model"].pop("_target_")
+    cfg_dict["model"]["model"] = cfg_dict["model"].pop("name")
+    trainer.logger.log_hyperparams(cfg_dict["model"])
+
+    # Data
+    data_module = cfg_dict["data"]["module"]
+    data_module.pop("_target_")
+    for key in ("train_transforms", "test_transforms"):
+        if data_module.get(key) is not None:
+            # Keep the last two parts of the dotted target path
+            data_module[key] = ".".join(
+                data_module[key]["_target_"].split(".")[-2:]
+            )
+    data_module.pop("name")
+    trainer.logger.log_hyperparams(data_module)
+
+    # Trainer
+    trainer_cfg = cfg_dict["trainer"]
+    for key in (
+        "_target_", "callbacks", "enable_checkpointing",
+        "enable_progress_bar", "logger", "num_sanity_val_steps",
+    ):
+        trainer_cfg.pop(key, None)
+    trainer.logger.log_hyperparams(trainer_cfg)
+
+
+@hydra.main(version_base=None, config_path="./cli_configs", config_name="train")
+def main(cfg):
+    uid = _prepare_cfg(cfg)
     print(OmegaConf.to_yaml(cfg))
 
-    # in case of Cross Validation loop over the folds (default is 1 (no Cross Validation))
+    base_run_name = cfg.trainer.logger.get("name", None)
+
+    # CV loop (default k=1 means no CV)
     for k in range(cfg.data.cv.k):
         if cfg.data.cv.k > 1:
             cfg.data.module.fold = k
-        else:
-            if cfg.data.module.fold is not None:
-                pass
-            else:
-                cfg.data.module.fold = "0"
+        elif cfg.data.module.fold is None:
+            cfg.data.module.fold = "0"
 
-        if cfg.trainer["enable_checkpointing"]:
-            for i in cfg.trainer.callbacks:
-                if i["_target_"] == "lightning.pytorch.callbacks.ModelCheckpoint":
-                    i["dirpath"] = os.path.join(
-                        str(cfg.exp_dir),
-                        str(cfg.data.module.name),
-                        "checkpoints",
-                        uid,
-                        str(cfg.data.module.fold),
-                    )
+        if base_run_name:
+            cfg.trainer.logger.name = f"{base_run_name}_fold{cfg.data.module.fold}"
 
-        # instantiate trainer, model and dataset
+        _set_checkpoint_dir(cfg, uid)
+
         trainer = instantiate(cfg.trainer)
         model = instantiate(cfg.model)
-        
-        #check which part of the model is trainable
+
+        # Useful when debugging which params are trainable:
         # for name, p in model.named_parameters():
         #     print(name, p.requires_grad)
 
@@ -81,41 +127,9 @@ def main(cfg):
             model = torch.compile(model, mode="default")
         dataset = instantiate(cfg.data).module
 
-        # log hypperparams and drop stuff that shouldn't be logged
-        ## Model
-        cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-        cfg_dict["model"].pop("_target_")
-        cfg_dict["model"]["model"] = cfg_dict["model"].pop("name")
-        trainer.logger.log_hyperparams(cfg_dict["model"])
+        _log_hyperparams(trainer, cfg)
 
-        ## Data
-        cfg_dict["data"]["module"].pop("_target_")
-        if cfg_dict["data"]["module"]["train_transforms"] is not None:
-            cfg_dict["data"]["module"]["train_transforms"] = ".".join(
-                cfg_dict["data"]["module"]["train_transforms"]["_target_"].split(".")[
-                -2:
-                ]
-            )
-        if cfg_dict["data"]["module"]["test_transforms"] is not None:
-            cfg_dict["data"]["module"]["test_transforms"] = ".".join(
-                cfg_dict["data"]["module"]["test_transforms"]["_target_"].split(".")[
-                -2:
-                ]
-            )
-        cfg_dict["data"]["module"].pop("name")
-        trainer.logger.log_hyperparams(cfg_dict["data"]["module"])
-
-        ## Trainer
-        cfg_dict["trainer"].pop("_target_")
-        cfg_dict["trainer"].pop("callbacks")
-        cfg_dict["trainer"].pop("enable_checkpointing")
-        cfg_dict["trainer"].pop("enable_progress_bar")
-        cfg_dict["trainer"].pop("logger")
-        cfg_dict["trainer"].pop("num_sanity_val_steps")
-        trainer.logger.log_hyperparams(cfg_dict["trainer"])
-
-        # start fitting
-        if cfg_dict["val_only"]:
+        if cfg.val_only:
             trainer.validate(model, dataset)
         else:
             trainer.fit(model, dataset, ckpt_path=cfg.get("ckpt_path", None))

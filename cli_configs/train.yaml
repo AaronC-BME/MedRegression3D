@@ -85,8 +85,8 @@ trainer:
       auto_insert_metric_name: False
       monitor: 'Val/MAE'              
       mode: 'min'                
-      save_top_k: 5              
-      save_last: true           
+      save_top_k: 3              
+      save_last: false           
       save_weights_only: false  
   devices: 1
   accelerator: 'gpu'

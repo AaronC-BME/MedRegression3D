@@ -1,14 +1,15 @@
 import math
 import warnings
+from functools import partial
 
 import lightning as L
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from madgrad import MADGRAD
 from timm.optim import RMSpropTF
 from torch.optim.lr_scheduler import _LRScheduler
-import torch.nn.functional as F
 from torchmetrics import (
     AUROC,
     Accuracy,
@@ -21,160 +22,243 @@ from torchmetrics import (
     Recall,
 )
 from torchmetrics.aggregation import CatMetric
-from metrics.balanced_accuracy import BalancedAccuracy
+
 from augmentation.mixup import mixup_criterion, mixup_data
+from losses.coral_loss import coral_loss, label_to_levels
+from metrics.balanced_accuracy import BalancedAccuracy
 from metrics.conf_mat import ConfusionMatrix
 from regularization.sam import SAM
-from losses.coral_loss import coral_loss, label_to_levels
-from functools import partial
-import os
-import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _flatten_per_class_f1(metrics_res, prefix):
+    """Replace `<prefix>F1_per_class` tensor entry with one scalar per class."""
+    key = f"{prefix}F1_per_class"
+    if key in metrics_res:
+        for i, value in enumerate(metrics_res[key]):
+            metrics_res[f"{prefix}F1_class_{i}"] = (
+                value if not torch.isnan(value) else 0.0
+            )
+        del metrics_res[key]
+    return metrics_res
+
+
+def _build_classification_metrics(metrics_list, metric_task, num_classes):
+    """Build the dict of torchmetrics for classification tasks."""
+    common = dict(task=metric_task, num_classes=num_classes, num_labels=num_classes)
+    out = {}
+    if "acc" in metrics_list:
+        out["Accuracy"] = Accuracy(**common)
+    if "balanced_acc" in metrics_list:
+        out["Balanced_Accuracy"] = BalancedAccuracy(task=metric_task, num_classes=num_classes)
+    if "f1" in metrics_list:
+        out["F1"] = F1Score(average="macro", **common)
+    if "f1_per_class" in metrics_list:
+        out["F1_per_class"] = F1Score(average=None, **common)
+    if "pr" in metrics_list:
+        out["Precision"] = Precision(average="macro", **common)
+        out["Recall"] = Recall(average="macro", **common)
+    if "top5acc" in metrics_list:
+        out["Accuracy_top5"] = Accuracy(top_k=5, **common)
+    if "auroc" in metrics_list:
+        out["AUROC"] = AUROC(average="macro", **common)
+    if "ap" in metrics_list:
+        out["AP"] = AveragePrecision(**common)
+    return out
+
+
+def _build_regression_metrics(metrics_list):
+    out = {}
+    if "mse" in metrics_list:
+        out["MSE"] = MeanSquaredError()
+    if "mae" in metrics_list:
+        out["MAE"] = MeanAbsoluteError()
+    return out
+
+
+VALID_TASKS = ("Classification", "Regression", "Ordinal_Regression")
+
+# Loss-function names valid for each task. None => task default.
+_VALID_LOSS_FNS = {
+    "Classification": (None, "focal", "topk10"),
+    "Regression": (None,),
+    "Ordinal_Regression": (
+        None, "focal", "topk10", "topk20",
+        "bce_focal", "bce_topk10", "bce_topk20",
+        "weighted_bce", "bce_mae",
+    ),
+}
+
+
+def _build_criterion(task, loss_fn, label_smoothing, subtask):
+    """Return the loss callable for a given (task, loss_fn) pair.
+
+    If ``loss_fn`` is ``None`` the task-specific default is used.
+    """
+    if task not in VALID_TASKS:
+        raise ValueError(f"Unknown task: {task!r}. Expected one of {VALID_TASKS}.")
+
+    valid = _VALID_LOSS_FNS[task]
+    if loss_fn not in valid:
+        raise ValueError(
+            f"Unknown loss_fn={loss_fn!r} for task={task!r}. "
+            f"Valid options are: {valid}."
+        )
+
+    # ---------- Classification ----------
+    if task == "Classification":
+        if loss_fn is None:
+            if subtask == "multiclass":
+                return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+            if subtask == "multilabel":
+                return nn.BCEWithLogitsLoss()
+            raise ValueError(f"Unknown subtask: {subtask!r}")
+        if loss_fn == "focal":
+            from losses.cls_loss import FocalLoss
+            print("Using Focal loss for Classification")
+            return FocalLoss()
+        if loss_fn == "topk10":
+            from losses.cls_loss import TopKLoss
+            print("Using Topk10 loss for Classification")
+            return TopKLoss()
+
+    # ---------- Regression ----------
+    if task == "Regression":
+        # Only None is valid (checked above).
+        return nn.MSELoss()
+
+    # ---------- Ordinal Regression ----------
+    if task == "Ordinal_Regression":
+        if loss_fn is None:
+            return coral_loss
+        if loss_fn == "focal":
+            from losses.coral_loss import coral_focal_loss
+            print("Using Coral Focal Loss (Gamma=3.0) for Ordinal Regression")
+            return partial(coral_focal_loss, gamma=3.0)
+        if loss_fn == "topk10":
+            from losses.coral_loss import coral_topk_loss
+            print("Using Coral TopK10 Loss for Ordinal Regression")
+            return coral_topk_loss
+        if loss_fn == "topk20":
+            from losses.coral_loss import coral_topk_loss
+            print("Using Coral TopK20 Loss for Ordinal Regression")
+            return partial(coral_topk_loss, k=20)
+        if loss_fn == "bce_focal":
+            from losses.coral_loss import combined_bce_focal_loss
+            print("Using Combined BCE and Focal Loss (Gamma=3.0) for Ordinal Regression")
+            return partial(combined_bce_focal_loss, gamma=3.0)
+        if loss_fn == "bce_topk10":
+            from losses.coral_loss import combined_bce_topk_loss
+            print("Using Combined BCE and TopK10 Loss for Ordinal Regression")
+            return combined_bce_topk_loss
+        if loss_fn == "bce_topk20":
+            from losses.coral_loss import combined_bce_topk_loss
+            print("Using Combined BCE and TopK20 Loss for Ordinal Regression")
+            return partial(combined_bce_topk_loss, topk=20)
+        if loss_fn == "weighted_bce":
+            # Weights are populated in setup() and passed in training/val step.
+            print("Using Weighted BCE Loss for Ordinal Regression")
+            return coral_loss
+        if loss_fn == "bce_mae":
+            from losses.coral_loss import combined_coral_mae_loss
+            print("Using BCE Loss and MAE (L1) Loss for Ordinal Regression")
+            return combined_coral_mae_loss
+
+    # Unreachable: guarded by the validity check above.
+    raise ValueError(f"Unhandled (task, loss_fn) pair: ({task!r}, {loss_fn!r}).")
+
+
+# ---------------------------------------------------------------------------
+# Main module
+# ---------------------------------------------------------------------------
 
 class BaseModel(L.LightningModule):
     def __init__(
-            self,
-            task,
-            metric_computation_mode,
-            result_plot,
-            metrics,
-            num_classes,
-            name,
-            lr,
-            weight_decay,
-            optimizer,
-            nesterov,
-            sam,
-            adaptive_sam,
-            scheduler,
-            T_max,
-            warmstart,
-            epochs,
-            mixup,
-            mixup_alpha,
-            label_smoothing,
-            stochastic_depth,
-            resnet_dropout,
-            squeeze_excitation,
-            apply_shakedrop,
-            undecay_norm,
-            zero_init_residual,
-            input_dim,
-            input_channels,
-            pretrained,
-            *args,
-            **kwargs
+        self,
+        task,
+        loss_fn,
+        metric_computation_mode,
+        result_plot,
+        metrics,
+        num_classes,
+        name,
+        lr,
+        weight_decay,
+        optimizer,
+        nesterov,
+        sam,
+        adaptive_sam,
+        scheduler,
+        T_max,
+        warmstart,
+        epochs,
+        mixup,
+        mixup_alpha,
+        label_smoothing,
+        stochastic_depth,
+        resnet_dropout,
+        squeeze_excitation,
+        apply_shakedrop,
+        undecay_norm,
+        zero_init_residual,
+        input_dim,
+        input_channels,
+        pretrained,
+        *args,
+        **kwargs,
     ):
-        super(BaseModel, self).__init__()
+        super().__init__()
 
-        # Task
+        # --- Task / subtask / loss ------------------------------------------
+        if task not in VALID_TASKS:
+            raise ValueError(
+                f"Unknown task: {task!r}. Expected one of {VALID_TASKS}."
+            )
         self.task = task
+        self.loss_fn = loss_fn  # None => task default
+        self.subtask = kwargs["subtask"]
 
-        # Metrics
+        # --- Metrics ----------------------------------------------------------
         self.metric_computation_mode = metric_computation_mode
         self.result_plot_setting = result_plot
-        metrics_dict = {}
 
-        self.subtask = kwargs["subtask"]
-        # print(f"[DEBUG] Subtask: {self.subtask}")
+        if self.task == "Classification":
+            metric_task = self.subtask  # "multiclass" or "multilabel"
+            metrics_dict = _build_classification_metrics(metrics, metric_task, num_classes)
+        elif self.task in ("Ordinal_Regression", "Regression"):
+            metrics_dict = _build_regression_metrics(metrics)
+        else:
+            metrics_dict = {}
 
-        if self.subtask == "multiclass":
-            metric_task = "multiclass"
-        elif self.subtask == "multilabel":
-            metric_task = "multilabel"
-
-        if "Classification" in self.task:
-            if "acc" in metrics:
-                metrics_dict["Accuracy"] = Accuracy(
-                    task=metric_task,
-                    num_classes=num_classes,
-                    num_labels=num_classes,
-                )
-            if "balanced_acc" in metrics:
-                metrics_dict["Balanced_Accuracy"] = BalancedAccuracy(
-                    task=metric_task,
-                    num_classes=num_classes,
-                )
-
-            if "f1" in metrics:
-                metrics_dict["F1"] = F1Score(
-                    average="macro",
-                    num_classes=num_classes,
-                    task=metric_task,
-                    num_labels=num_classes,
-                )
-            if "f1_per_class" in metrics:
-                metrics_dict["F1_per_class"] = F1Score(
-                    average=None,
-                    num_classes=num_classes,
-                    task=metric_task,
-                    num_labels=num_classes,
-                )
-            if "pr" in metrics:
-                metrics_dict["Precision"] = Precision(
-                    average="macro",
-                    num_classes=num_classes,
-                    task=metric_task,
-                    num_labels=num_classes,
-                )
-                metrics_dict["Recall"] = Recall(
-                    average="macro",
-                    num_classes=num_classes,
-                    task=metric_task,
-                    num_labels=num_classes,
-                )
-            if "top5acc" in metrics:
-                metrics_dict["Accuracy_top5"] = Accuracy(
-                    task=metric_task,
-                    num_classes=num_classes,
-                    top_k=5,
-                    num_labels=num_classes,
-                )
-            if "auroc" in metrics:
-                metrics_dict["AUROC"] = AUROC(
-                    average="macro",
-                    task=metric_task,
-                    num_classes=num_classes,
-                    num_labels=num_classes,
-                )
-            if "ap" in metrics:
-                metrics_dict["AP"] = AveragePrecision(
-                    task=metric_task,
-                    num_classes=num_classes,
-                    num_labels=num_classes,
-                )
-
-        elif self.task.startswith("Ordinal_Regression") or self.task == "Regression":
-            if "mse" in metrics:
-                metrics_dict["MSE"] = MeanSquaredError()
-            if "mae" in metrics:
-                metrics_dict["MAE"] = MeanAbsoluteError()
-
-        if self.result_plot_setting in ["val", "all"]:
-            if "Classification" in self.task:
+        # Result-plotting bookkeeping
+        if self.result_plot_setting in ("val", "all"):
+            if self.task == "Classification":
                 self.val_conf_mat = ConfusionMatrix(num_classes=num_classes)
-            elif self.task.startswith("Ordinal_Regression") or self.task == "Regression":
+            elif self.task in ("Ordinal_Regression", "Regression"):
                 self.val_pred_list = []
                 self.val_label_list = []
         if self.result_plot_setting == "all":
-            if "Classification" in self.task:
+            if self.task == "Classification":
                 self.train_conf_mat = ConfusionMatrix(num_classes=num_classes)
-            elif self.task.startswith("Ordinal_Regression") or self.task == "Regression":
+            elif self.task in ("Ordinal_Regression", "Regression"):
                 self.train_pred_list = []
                 self.train_label_list = []
 
-        self.save_preds = True if kwargs["save_preds"] else False
+        self.save_preds = bool(kwargs["save_preds"])
         if self.save_preds:
             self.val_preds = CatMetric(dist_sync_on_step=False)
             self.val_labels = CatMetric(dist_sync_on_step=False)
             self.val_indices = CatMetric(dist_sync_on_step=False)
 
-        metrics = MetricCollection(metrics_dict)
-        self.train_metrics = metrics.clone(prefix="Train/")
-        self.val_metrics = metrics.clone(prefix="Val/")
+        metric_collection = MetricCollection(metrics_dict)
+        self.train_metrics = metric_collection.clone(prefix="Train/")
+        self.val_metrics = metric_collection.clone(prefix="Val/")
 
-        # Training Args
+        # --- Training args ----------------------------------------------------
         self.name = name
-        # self.batch_size = batch_size
         self.lr = lr
         self.weight_decay = weight_decay
         self.optimizer = optimizer
@@ -188,131 +272,126 @@ class BaseModel(L.LightningModule):
         self.epochs = epochs
         self.pretrained = pretrained
 
-        # Regularization techniques
+        # --- Regularization ---------------------------------------------------
         self.mixup = mixup
-        self.mixup_alpha = mixup_alpha  # 0.2
-        self.label_smoothing = label_smoothing  # 0.1
-        self.stochastic_depth = (
-            stochastic_depth  # 0.1 (with higher resolution maybe 0.2)
-        )
-        self.resnet_dropout = resnet_dropout  # 0.5
+        self.mixup_alpha = mixup_alpha
+        self.label_smoothing = label_smoothing
+        self.stochastic_depth = stochastic_depth
+        self.resnet_dropout = resnet_dropout
         self.se = squeeze_excitation
         self.apply_shakedrop = apply_shakedrop
         self.undecay_norm = undecay_norm
         self.zero_init_residual = zero_init_residual
 
-        # Finetuning method
+        # --- Finetuning -------------------------------------------------------
         self.finetuning_method = kwargs["finetune_method"]
 
-        # Data and Dataloading
+        # --- Data -------------------------------------------------------------
         self.input_dim = input_dim
         self.input_channels = input_channels
         self.num_classes = num_classes
 
-        # switch to manual optimization for Sharpness Aware Minimization
+        # SAM uses manual optimization
         if self.sam:
             self.automatic_optimization = False
 
-        # Loss
-        if self.task == "Classification":
-            if self.subtask == "multiclass":
-                self.criterion = nn.CrossEntropyLoss(
-                    label_smoothing=self.label_smoothing
-                )
-            elif self.subtask == "multilabel":
-                self.criterion = nn.BCEWithLogitsLoss()
-        elif self.task == "Classification_Focal_Loss":
-            from losses.cls_loss import FocalLoss
-            print("Using Focal loss for Classification")
-            self.criterion = FocalLoss()
-        elif self.task == "Classification_Topk10_Loss":
-            from losses.cls_loss import TopKLoss
-            print("Using Topk10 loss for Classification")
-            self.criterion = TopKLoss()
-        elif self.task == "Regression":
-            self.criterion = nn.MSELoss()
-        elif self.task == "Ordinal_Regression":
-            self.criterion = coral_loss
-        elif self.task == "Ordinal_Regression_Focal_Loss":
-            from losses.coral_loss import coral_focal_loss
-            print("Using Coral Focal Loss (Gamma=3.0) for Ordinal Regression")
-            self.criterion = partial(coral_focal_loss, gamma=3.0)
-        elif self.task == "Ordinal_Regression_TopK10Loss":
-            from losses.coral_loss import coral_topk_loss
-            print("Using Coral TopK10 Loss for Ordinal Regression")
-            self.criterion = coral_topk_loss
-        elif self.task == "Ordinal_Regression_TopK20Loss":
-            from losses.coral_loss import coral_topk_loss
-            print("Using Coral TopK20 Loss for Ordinal Regression")
-            self.criterion = partial(coral_topk_loss, k=20)
-        elif self.task == "Ordinal_Regression_BCE_Focal_Loss":
-            from losses.coral_loss import combined_bce_focal_loss
-            print("Using Combined BCE and Focal Loss (Gamma=3.0) for Ordinal Regression")
-            self.criterion = partial(combined_bce_focal_loss, gamma=3.0)
-        elif self.task == "Ordinal_Regression_BCE_TopK10Loss":
-            from losses.coral_loss import combined_bce_topk_loss
-            print("Using Combined BCE and TopK10 Loss for Ordinal Regression")
-            self.criterion = combined_bce_topk_loss
-        elif self.task == "Ordinal_Regression_BCE_TopK20Loss":
-            from losses.coral_loss import combined_bce_topk_loss
-            print("Using Combined BCE and TopK20 Loss for Ordinal Regression")
-            self.criterion = partial(combined_bce_topk_loss, topk=20)
-        elif self.task == "Ordinal_Regression_Weighted_BCE":
-            print("Using Weighted BCE Loss for Ordinal Regression")
-            self.criterion = coral_loss  # defer weight passing to training_step
-        elif self.task == "Ordinal_Regression_BCE+MAE_Loss":
-            from losses.coral_loss import combined_coral_mae_loss
-            print("Using BCE Loss and MAE (L1) Loss for Ordinal Regression")
-            self.criterion = combined_coral_mae_loss
-        else:
-            raise ValueError(f"Unknown ordinal regression loss: {self.task}")
+        # --- Loss -------------------------------------------------------------
+        self.criterion = _build_criterion(
+            self.task, self.loss_fn, self.label_smoothing, self.subtask,
+        )
+
+    # -----------------------------------------------------------------------
+    # Forward / setup
+    # -----------------------------------------------------------------------
 
     def forward(self, x):
         pass
 
     def setup(self, stage=None):
         self.level_weights = None
-
-        if "Weighted_BCE" in self.task:
+        if self.loss_fn == "weighted_bce":
             print("Setting up level weights for Ordinal Regression Weighted BCE")
             self.level_weights = self.trainer.datamodule.level_weights.to(self.device)
 
+    # -----------------------------------------------------------------------
+    # Step helpers
+    # -----------------------------------------------------------------------
+
+    @property
+    def _is_ordinal(self):
+        return self.task == "Ordinal_Regression"
+
+    def _forward_logits(self, x):
+        """Run forward and return logits only (handles tuple-returning ordinal heads)."""
+        out = self(x)
+        if self._is_ordinal and isinstance(out, tuple):
+            return out[0]
+        return out
+
+    def _compute_loss(self, y_hat, y):
+        """Standard (non-mixup, non-SAM) loss given logits and labels."""
+        if self._is_ordinal:
+            levels = label_to_levels(y, self.num_classes)
+            if self.loss_fn == "bce_mae":
+                return self.criterion(
+                    y_hat, levels, y, importance_weights=self.level_weights
+                )
+            if self.loss_fn == "weighted_bce":
+                return self.criterion(
+                    y_hat, levels, importance_weights=self.level_weights
+                )
+            return self.criterion(y_hat, levels)
+
+        target = y.float() if self.subtask == "multilabel" else y.long()
+        return self.criterion(y_hat, target)
+
+    def _update_metrics(self, metrics_obj, y_hat, y):
+        """Update an epochwise MetricCollection with predictions in the right form."""
+        if self.task == "Classification":
+            if self.subtask == "multilabel":
+                metrics_obj.update(torch.sigmoid(y_hat.detach()), y)
+            else:  # multiclass
+                metrics_obj.update(F.softmax(y_hat.detach(), dim=-1), y)
+        elif self._is_ordinal:
+            pred_classes = (torch.sigmoid(y_hat.detach()) > 0.5).int().sum(dim=1)
+            metrics_obj.update(pred_classes, y)
+        else:
+            metrics_obj.update(y_hat.view(-1).detach(), y.view(-1))
+
+    def _log_metrics(self, metrics_res, prefix):
+        _flatten_per_class_f1(metrics_res, prefix)
+        self.log_dict(
+            metrics_res,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
+    # -----------------------------------------------------------------------
+    # Training step
+    # -----------------------------------------------------------------------
+
     def training_step(self, batch, batch_idx):
+        x, y = batch
 
-        x, y = batch #, subjectID
-
-        # Save input tensors for inspection during first epoch, first batch, on rank 0 only
-        # if self.global_rank == 0 and self.current_epoch == 0 and batch_idx == 0:
-        #     debug_dir = os.path.join(self.logger.save_dir if hasattr(self, "logger") else ".", "debug_inputs")
-        #     os.makedirs(debug_dir, exist_ok=True)
-        #     for i in range(x.shape[0]):
-        #         case_id = subjectID[i]
-        #         npy_path = os.path.join(debug_dir, f"{case_id}.npy")
-        #         np.save(npy_path, x[i].cpu().numpy())
-
+        # Forward + (mixup) target prep
         if self.mixup:
             inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=self.mixup_alpha)
             y_hat = self(inputs)
-        elif self.task.startswith("Ordinal_Regression"):
-            out = self(x)
-            if isinstance(out, tuple):
-                y_hat = out[0]
-            else:
-                y_hat = out
         else:
-            y_hat = self(x)
-
-            if self.num_classes == 1:
+            y_hat = self._forward_logits(x)
+            if (not self._is_ordinal) and self.num_classes == 1:
                 y_hat = y_hat.view(-1)
 
+        # Edge case: batch size 1 with squeezed batch dim
         if x.shape[0] == 1 and len(y_hat.shape) == 1:
-            # for cases where batch size is 1 and y_hat doesn't have a batch dim
             y_hat = y_hat.unsqueeze(0)
 
+        # SAM uses manual optimization with two forward/backward passes
         if self.sam:
             opt = self.optimizers()
 
-            # first forward-backward pass
             if self.mixup:
                 loss = mixup_criterion(self.criterion, y_hat, targets_a, targets_b, lam)
             else:
@@ -320,7 +399,6 @@ class BaseModel(L.LightningModule):
             self.manual_backward(loss)
             opt.first_step(zero_grad=True)
 
-            # second forward-backward pass
             if self.mixup:
                 self.manual_backward(
                     mixup_criterion(
@@ -328,69 +406,33 @@ class BaseModel(L.LightningModule):
                     )
                 )
             else:
+                second = self(x)
                 if self.num_classes == 1:
-                    self.manual_backward(self.criterion(self(x).view(-1), y))
-                else:
-                    self.manual_backward(self.criterion(self(x), y))
+                    second = second.view(-1)
+                self.manual_backward(self.criterion(second, y))
             opt.second_step(zero_grad=True)
-
         else:
             if self.mixup:
                 loss = mixup_criterion(self.criterion, y_hat, targets_a, targets_b, lam)
             else:
-                if self.task.startswith("Ordinal_Regression"):
-                    levels = label_to_levels(y, self.num_classes)
-                    if self.task == "Ordinal_Regression_BCE+MAE_Loss":
-                        loss = self.criterion(y_hat, levels, y, importance_weights=self.level_weights)
-                    elif "Weighted" in self.task:
-                        loss = self.criterion(y_hat, levels, importance_weights=sample_weights)
-                    else:
-                        loss = self.criterion(y_hat, levels)
-                else:
-                    loss = self.criterion(
-                        y_hat, y.float() if self.subtask == "multilabel" else y.long()
-                    )
+                loss = self._compute_loss(y_hat, y)
 
         self.log(
-            "Train/loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
+            "Train/loss", loss,
+            on_step=False, on_epoch=True, prog_bar=True, sync_dist=True,
         )
 
         if torch.isnan(y_hat).any():
             print("######################################### Model predicts NaNs!")
 
-        # save metrics
+        # Metrics
         if self.metric_computation_mode == "stepwise":
             metrics_res = self.train_metrics(y_hat, y)
-            if "Train/F1_per_class" in metrics_res.keys():
-                for i, value in enumerate(metrics_res["Train/F1_per_class"]):
-                    metrics_res["Train/F1_class_{}".format(i)] = (
-                        value if not torch.isnan(value) else 0.0
-                    )
-                del metrics_res["Train/F1_per_class"]
-            self.log_dict(
-                metrics_res,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,
-            )
+            self._log_metrics(metrics_res, "Train/")
         elif self.metric_computation_mode == "epochwise":
-            if "Classification" in self.task:
-                if self.subtask == "multilabel":
-                    self.train_metrics.update(torch.sigmoid(y_hat.detach()), y)
-                elif self.subtask == "multiclass":
-                    self.train_metrics.update(F.softmax(y_hat.detach(), dim=-1), y)
-            elif self.task.startswith("Ordinal_Regression"):
-                pred_classes = (torch.sigmoid(y_hat.detach()) > 0.5).int().sum(dim=1)
-                self.train_metrics.update(pred_classes, y)
-            else:
-                self.train_metrics.update(y_hat.view(-1).detach(), y.view(-1))
+            self._update_metrics(self.train_metrics, y_hat, y)
 
+        # Optional plot bookkeeping
         if hasattr(self, "train_conf_mat"):
             self.train_conf_mat.update(y_hat, y)
         if hasattr(self, "train_pred_list"):
@@ -399,132 +441,124 @@ class BaseModel(L.LightningModule):
 
         return loss
 
+    # -----------------------------------------------------------------------
+    # Validation step
+    # -----------------------------------------------------------------------
+
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        if self.task.startswith("Ordinal_Regression"):
-            out = self(x)
-            if isinstance(out, tuple):
-                y_hat = out[0]
-            else:
-                y_hat = out
-        else:
-            y_hat = self(x)
 
+        y_hat = self._forward_logits(x)
         if self.num_classes == 1:
             y_hat = y_hat.view(-1)
 
-        if self.task.startswith("Ordinal_Regression"):
-            levels = label_to_levels(y, self.num_classes)
-            if self.task == "Ordinal_Regression_BCE+MAE_Loss":
-                val_loss = self.criterion(y_hat, levels, y, importance_weights=self.level_weights)
-            elif "Weighted" in self.task:
-                val_loss = self.criterion(y_hat, levels, importance_weights=sample_weights)
-            else:
-                val_loss = self.criterion(y_hat, levels)
-        else:
-            val_loss = self.criterion(
-                y_hat, y.float() if self.subtask == "multilabel" else y.long()
-            )
+        val_loss = self._compute_loss(y_hat, y)
 
         self.log(
-            "Val/loss",
-            val_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,  # True if self.trainer.num_devices > 1 else False,
+            "Val/loss", val_loss,
+            on_step=False, on_epoch=True, prog_bar=True, sync_dist=True,
         )
 
-        # save metrics
         if self.metric_computation_mode == "stepwise":
             metrics_res = self.val_metrics(y_hat, y)
-            if "Val/F1_per_class" in metrics_res.keys():
-                for i, value in enumerate(metrics_res["Val/F1_per_class"]):
-                    metrics_res["Val/F1_class_{}".format(i)] = (
-                        value if not torch.isnan(value) else 0.0
-                    )
-                del metrics_res["Val/F1_per_class"]
-            self.log_dict(
-                metrics_res,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,  # True if self.trainer.num_devices > 1 else False,
-            )
+            self._log_metrics(metrics_res, "Val/")
         elif self.metric_computation_mode == "epochwise":
-            if "Classification" in self.task:
-                if self.subtask == "multilabel":
-                    self.val_metrics.update(torch.sigmoid(y_hat.detach()), y)
-                elif self.subtask == "multiclass":
-                    self.val_metrics.update(F.softmax(y_hat.detach(), dim=-1), y)
-            elif self.task.startswith("Ordinal_Regression"):
-                pred_classes = (torch.sigmoid(y_hat.detach()) > 0.5).int().sum(dim=1)
-                self.val_metrics.update(pred_classes, y)
-            else:
-                self.val_metrics.update(y_hat.detach(), y)
-
+            self._update_metrics(self.val_metrics, y_hat, y)
 
         if hasattr(self, "val_conf_mat"):
             self.val_conf_mat.update(y_hat, y)
         if hasattr(self, "val_preds"):
-            """self.val_pred_list.extend(y_hat.detach().cpu())
-            self.val_label_list.extend(y.detach().cpu())"""
-            actual_batch_size = x.size(0)  # dynamic size (works for last batch)
+            actual_batch_size = x.size(0)
             start_idx = batch_idx * self.trainer.val_dataloaders.batch_size
             idx = torch.arange(
                 start_idx, start_idx + actual_batch_size, device=self.device
             )
-
             self.val_preds.update(y_hat.detach())
             self.val_labels.update(y.detach())
             self.val_indices.update(idx)
 
-    def predict_step(self, batch, batch_idx):
+    # -----------------------------------------------------------------------
+    # Predict
+    # -----------------------------------------------------------------------
 
+    def predict_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-
         if self.num_classes == 1:
             y_hat = y_hat.view(-1)
-
-        # self.predictions.append(y_hat)
         return y, y_hat
+
+    # -----------------------------------------------------------------------
+    # Epoch ends
+    # -----------------------------------------------------------------------
+
+    def _log_val_predictions_table(self, preds_all, labels_all):
+        """Log per-sample prediction table to W&B based on task type."""
+        if self.task == "Classification":
+            columns = (
+                ["GT_" + str(i) for i in range(len(labels_all[0]))]
+                if self.subtask == "multilabel"
+                else ["GT"]
+            ) + ["Pred_" + str(i) for i in range(len(preds_all[0]))]
+            data = [
+                (
+                    (x.tolist() if self.subtask == "multilabel" else [x])
+                    + (
+                        F.softmax(y, dim=-1)
+                        if self.subtask == "multiclass"
+                        else torch.sigmoid(y)
+                    ).tolist()
+                )
+                for x, y in zip(labels_all, preds_all)
+            ]
+            table = wandb.Table(data=data, columns=columns)
+            wandb.log({"Val Predictions": table})
+
+        elif self.task == "Regression":
+            data = [[x.item(), y.item()] for x, y in zip(labels_all, preds_all)]
+            table = wandb.Table(data=data, columns=["GT", "Pred"])
+            wandb.log({"Val Predictions": table})
+
+        elif self._is_ordinal:
+            binary_preds = (torch.sigmoid(preds_all) > 0.5).int()
+            expected_ages = binary_preds.sum(dim=1)
+            data = [[x.item(), y.item()] for x, y in zip(labels_all, expected_ages)]
+            table = wandb.Table(data=data, columns=["GT", "Pred"])
+            wandb.log({"Val Predictions": table})
+
+        else:
+            raise NotImplementedError
+
+    def _log_val_scatterplot(self, preds_all, labels_all):
+        """Scatterplot of GT vs prediction for Regression / Ordinal Regression."""
+        if self.task == "Regression":
+            data = [[x, y] for (x, y) in zip(labels_all, preds_all)]
+        elif self._is_ordinal:
+            binary_preds = (torch.sigmoid(preds_all) > 0.5).int()
+            expected_ages = binary_preds.sum(dim=1)
+            data = [[x, y] for (x, y) in zip(labels_all, expected_ages)]
+        else:
+            return
+
+        table = wandb.Table(data=data, columns=["Ground Truth", "Prediction"])
+        wandb.log({
+            "Val Scatterplot": wandb.plot.scatter(
+                table, "Ground Truth", "Prediction", "Validation Scatterplot",
+            )
+        })
 
     def on_validation_epoch_end(self) -> None:
         if self.metric_computation_mode == "epochwise":
             metrics_res = self.val_metrics.compute()
-            if "Val/F1_per_class" in metrics_res.keys():
-                for i, value in enumerate(metrics_res["Val/F1_per_class"]):
-                    metrics_res["Val/F1_class_{}".format(i)] = (
-                        value if not torch.isnan(value) else 0.0
-                    )
-                del metrics_res["Val/F1_per_class"]
-            self.log_dict(
-                metrics_res,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,  # True if self.trainer.num_devices > 1 else False,
-            )
-
+            self._log_metrics(metrics_res, "Val/")
             self.val_metrics.reset()
 
         if hasattr(self, "val_conf_mat"):
             self.val_conf_mat.save_state(self, "val")
             self.val_conf_mat.reset()
-        if hasattr(self, "val_preds"):
-            """# Stack tensors along batch dim
-            val_preds = torch.stack(self.val_pred_list, dim=0).to(self.device)
-            val_labels = torch.stack(self.val_label_list, dim=0).to(self.device)
-            # print(len(self.val_pred_list), val_preds.shape)
-            # Gather from all GPUs
-            preds_all = self.all_gather(val_preds)
-            preds_all = preds_all.view(-1, *preds_all.shape[2:])
-            labels_all = self.all_gather(val_labels)
-            labels_all = labels_all.view(-1, *labels_all.shape[2:])
-            # print(preds_all.shape)"""
 
-            preds_all = self.val_preds.compute()  # shape: [N_total, C]
+        if hasattr(self, "val_preds"):
+            preds_all = self.val_preds.compute()
             labels_all = self.val_labels.compute()
             indices = self.val_indices.compute()
 
@@ -533,83 +567,12 @@ class BaseModel(L.LightningModule):
                 sorted_idx = torch.argsort(indices)
                 preds_all = preds_all[sorted_idx]
                 labels_all = labels_all[sorted_idx]
-                if self.task == "Regression":
-                    data = [[x, y] for (x, y) in zip(labels_all, preds_all)]
-                    table = wandb.Table(
-                        data=data, columns=["Ground Truth", "Prediction"]
-                    )
-                    wandb.log(
-                        {
-                            "Val Scatterplot": wandb.plot.scatter(
-                                table,
-                                "Ground Truth",
-                                "Prediction",
-                                "Validation Scatterplot",
-                            )
-                        }
-                    )
-                elif self.task.startswith("Ordinal_Regression"):
-                    # expected_ages = torch.sum(torch.sigmoid(preds_all), dim=1)
-                    binary_preds = (torch.sigmoid(preds_all) > 0.5).int()
-                    expected_ages = binary_preds.sum(dim=1)
-                    data = [[x, y] for (x, y) in zip(labels_all, expected_ages)]
-                    table = wandb.Table(
-                        data=data, columns=["Ground Truth", "Prediction"]
-                    )
-                    wandb.log({
-                        "Val Scatterplot": wandb.plot.scatter(
-                            table,
-                            "Ground Truth",
-                            "Prediction",
-                            "Validation Scatterplot",
-                        )
-                    })
-                    
+
+                self._log_val_scatterplot(preds_all, labels_all)
+
                 if self.save_preds:
+                    self._log_val_predictions_table(preds_all, labels_all)
 
-                    if "Classification" in self.task:
-                        columns = (
-                                      (["GT_" + str(i) for i in range(len(labels_all[0]))])
-                                      if self.subtask == "multilabel"
-                                      else ["GT"]
-                                  ) + ["Pred_" + str(i) for i in range(len(preds_all[0]))]
-                        data = [
-                            (
-                                    (x.tolist() if self.subtask == "multilabel" else [x])
-                                    + (
-                                        F.softmax(y, dim=-1)
-                                        if self.subtask == "multiclass"
-                                        else torch.sigmoid(y)
-                                    ).tolist()
-                            )
-                            for x, y in zip(labels_all, preds_all)
-                        ]
-                        table = wandb.Table(data=data, columns=columns)
-                        wandb.log({"Val Predictions": table})
-                    
-                    elif self.task == "Regression":
-                        columns = ["GT", "Pred"]
-                        data = [
-                            [x.item(), y.item()]
-                            for x, y in zip(labels_all, preds_all)
-                        ]
-                        table = wandb.Table(data=data, columns=columns)
-                        wandb.log({"Val Predictions": table})
-                    
-                    elif self.task.startswith("Ordinal_Regression"):
-                        # Convert logits to expected age
-                        # expected_ages = torch.sum(torch.sigmoid(preds_all), dim=1)
-                        binary_preds = (torch.sigmoid(preds_all) > 0.5).int()
-                        expected_ages = binary_preds.sum(dim=1)
-                        columns = ["GT", "Pred"]
-                        data = [[x.item(), y.item()] for x, y in zip(labels_all, expected_ages)]
-                        table = wandb.Table(data=data, columns=columns)
-                        wandb.log({"Val Predictions": table})
-
-                    else:
-                        raise NotImplementedError
-
-            # reset
             self.val_preds.reset()
             self.val_labels.reset()
             self.val_indices.reset()
@@ -617,515 +580,371 @@ class BaseModel(L.LightningModule):
     def on_train_epoch_end(self) -> None:
         if self.metric_computation_mode == "epochwise":
             metrics_res = self.train_metrics.compute()
-            if "Train/F1_per_class" in metrics_res.keys():
-                for i, value in enumerate(metrics_res["Train/F1_per_class"]):
-                    metrics_res["Train/F1_class_{}".format(i)] = (
-                        value if not torch.isnan(value) else 0.0
-                    )
-                del metrics_res["Train/F1_per_class"]
-
-            self.log_dict(
-                metrics_res,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,  # True if self.trainer.num_devices > 1 else False,
-            )
-
+            self._log_metrics(metrics_res, "Train/")
             self.train_metrics.reset()
 
         if hasattr(self, "train_conf_mat"):
             self.train_conf_mat.save_state(self, "train")
             self.train_conf_mat.reset()
+
         if hasattr(self, "train_pred_list"):
             data = [
                 [x, y] for (x, y) in zip(self.train_label_list, self.train_pred_list)
             ]
             table = wandb.Table(data=data, columns=["Ground Truth", "Prediction"])
-            wandb.log(
-                {
-                    "Train Scatterplot": wandb.plot.scatter(
-                        table, "Ground Truth", "Prediction", "Train Scatterplot"
-                    )
-                }
-            )
-            # reset
+            wandb.log({
+                "Train Scatterplot": wandb.plot.scatter(
+                    table, "Ground Truth", "Prediction", "Train Scatterplot",
+                )
+            })
             self.train_pred_list = []
             self.train_label_list = []
 
+    # -----------------------------------------------------------------------
+    # Init from scratch (when not pretrained)
+    # -----------------------------------------------------------------------
+
     def on_train_start(self):
-        # from models.preact_resnet import PreActBlock, PreActBottleneck
-        # from models.pyramidnet import BasicBlock as BasicBlock_pyramid
-        # from models.pyramidnet import Bottleneck as Bottleneck_pyramid
-        # from models.resnet import BasicBlock, Bottleneck
-        # from models.wide_resnet import BasicBlock as Wide_BasicBlock
-        # from models.wide_resnet import Bottleneck as Wide_Bottleneck
+        if self.pretrained:
+            return
 
-        if not self.pretrained:
-            print("Initializing weights")
-            for m in self.modules():
-                if isinstance(m, nn.Conv2d):
-                    nn.init.kaiming_normal_(
-                        m.weight, mode="fan_out", nonlinearity="relu"
-                    )
-                    # nn.init.xavier_uniform_(m.weight, gain=np.sqrt(2))
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-                elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, nn.SyncBatchNorm)):
-                    nn.init.constant_(m.weight, 1)
+        print("Initializing weights")
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-                elif isinstance(m, nn.Linear):
-                    nn.init.normal_(m.weight, std=1e-3)
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, nn.SyncBatchNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=1e-3)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
-            # Zero-initialize the last BN in each residual branch,
-            # so that the residual branch starts with zeros, and each residual block behaves like an identity.
-            # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
-            # TODO
-            # if self.zero_init_residual:
-            #     if "PreAct" in self.name:
-            #         for m in self.modules():
-            #             if isinstance(m, PreActBottleneck):
-            #                 nn.init.constant_(m.conv3.weight, 0)
-            #             elif isinstance(m, PreActBlock):
-            #                 nn.init.constant_(m.conv2.weight, 0)
-            #
-            #     elif "ResNet" in self.name or "WRN" in self.name:
-            #         for m in self.modules():
-            #             if isinstance(m, Bottleneck) or isinstance(m, Wide_Bottleneck):
-            #                 nn.init.constant_(m.bn3.weight, 0)
-            #             elif isinstance(m, BasicBlock) or isinstance(
-            #                     m, Wide_BasicBlock
-            #             ):
-            #                 nn.init.constant_(m.bn2.weight, 0)
-            #
-            #     elif "Pyramid" in self.name:
-            #         for m in self.modules():
-            #             if isinstance(m, Bottleneck_pyramid):
-            #                 nn.init.constant_(m.bn4.weight, 0)
-            #             elif isinstance(m, BasicBlock_pyramid):
-            #                 nn.init.constant_(m.bn3.weight, 0)
+    # -----------------------------------------------------------------------
+    # Optimizer / scheduler
+    # -----------------------------------------------------------------------
 
-    def configure_optimizers(self):
-        # leave bias and params of batch norm undecayed as in https://arxiv.org/pdf/1812.01187.pdf (Bag of tricks)
+    def _split_params_for_sawtooth(self):
+        """Group named params into encoder vs head (cls_head or reg_head)."""
+        encoder_params, cls_head_params, reg_head_params = [], [], []
+        for name, param in self.named_parameters():
+            if "encoder" in name:
+                encoder_params.append(param)
+            elif "cls_head" in name:
+                cls_head_params.append(param)
+            elif "reg_head" in name:
+                reg_head_params.append(param)
+
+        if cls_head_params:
+            return encoder_params, cls_head_params, "cls_head"
+        return encoder_params, reg_head_params, "reg_head"
+
+    def _build_param_groups(self):
+        """Param groups for optimizers. Returns either an iterable of params or
+        a list of param-group dicts (when sawtooth fine-tuning is on)."""
+        # Optionally split norm/bias params off from weight decay.
         if self.undecay_norm:
-            model_params = []
-            norm_params = []
+            model_params, norm_params = [], []
             for name, p in self.named_parameters():
-                if p.requires_grad:
-                    if "norm" in name or "bias" in name or "bn" in name:
-                        norm_params += [p]
-                    else:
-                        model_params += [p]
-            params = [
+                if not p.requires_grad:
+                    continue
+                if "norm" in name or "bias" in name or "bn" in name:
+                    norm_params.append(p)
+                else:
+                    model_params.append(p)
+            base_params = [
                 {"params": model_params},
                 {"params": norm_params, "weight_decay": 0},
             ]
         else:
-            params = self.parameters()
+            base_params = self.parameters()
 
-        if self.finetuning_method == "full_sawtooth":
-            # Separate encoder and cls_head parameters
-            encoder_params = []
-            cls_head_params = []
-            reg_head_params = []
+        if self.finetuning_method != "full_sawtooth":
+            return base_params
 
-            for name, param in self.named_parameters():
-                if "encoder" in name:
-                    encoder_params.append(param)
-                elif "cls_head" in name:
-                    cls_head_params.append(param)
-                elif "reg_head" in name:
-                    reg_head_params.append(param)
-        
-            head_params = cls_head_params if len(cls_head_params) > 0 else reg_head_params
-            head_name = "cls_head" if len(cls_head_params) > 0 else "reg_head"
+        # Sawtooth: separate head from encoder so the scheduler can warm them
+        # up independently. We always rebuild the groups directly from named
+        # params (the undecay_norm split is not combined with sawtooth).
+        encoder_params, head_params, head_name = self._split_params_for_sawtooth()
 
-        if not self.sam:
+        common_head = {
+            "params": head_params,
+            "lr": self.lr,
+            "weight_decay": self.weight_decay,
+            "name": head_name,
+        }
+        common_enc = {
+            "params": encoder_params,
+            "lr": self.lr,
+            "weight_decay": self.weight_decay,
+            "name": "encoder",
+        }
+        # Some optimizers want momentum in the group dict
+        if self.optimizer in ("SGD", "Madgrad"):
+            common_head["momentum"] = 0.9
+            common_enc["momentum"] = 0.9
             if self.optimizer == "SGD":
-                if self.finetuning_method == "full_sawtooth":
-                    optimizer = torch.optim.SGD(
-                        [
-                            {
-                                "params": head_params,
-                                "lr": self.lr,
-                                "momentum": 0.9,
-                                "weight_decay": self.weight_decay,
-                                "nesterov": self.nesterov,
-                                "name": head_name,
-                            },
-                            {
-                                "params": encoder_params,
-                                "lr": self.lr,
-                                "momentum": 0.9,
-                                "weight_decay": self.weight_decay,
-                                "nesterov": self.nesterov,
-                                "name": "encoder",
-                            },
-                        ]
-                    )
+                common_head["nesterov"] = self.nesterov
+                common_enc["nesterov"] = self.nesterov
 
-                else:
-                    optimizer = torch.optim.SGD(
-                        params,
-                        lr=self.lr,
-                        momentum=0.9,
-                        weight_decay=self.weight_decay,
-                        nesterov=self.nesterov,
-                    )
-            elif self.optimizer == "Adam":
-                if self.finetuning_method == "full_sawtooth":
-                    optimizer = torch.optim.Adam(
-                        [
-                            {
-                                "params": head_params,
-                                "lr": self.lr,
-                                "weight_decay": self.weight_decay,
-                                "name": head_name,
-                            },
-                            {
-                                "params": encoder_params,
-                                "lr": self.lr,
-                                "weight_decay": self.weight_decay,
-                                "name": "encoder",
-                            },
-                        ]
-                    )
+        return [common_head, common_enc]
 
-                else:
-                    optimizer = torch.optim.Adam(
-                        params, lr=self.lr, weight_decay=self.weight_decay
-                    )
-            elif self.optimizer == "AdamW":
+    def _build_optimizer(self, params):
+        """Construct optimizer (non-SAM path)."""
+        if self.optimizer == "SGD":
+            return torch.optim.SGD(
+                params, lr=self.lr, momentum=0.9,
+                weight_decay=self.weight_decay, nesterov=self.nesterov,
+            )
+        if self.optimizer == "Adam":
+            return torch.optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
+        if self.optimizer == "AdamW":
+            return torch.optim.AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+        if self.optimizer == "Rmsprop":
+            return RMSpropTF(params, lr=self.lr, weight_decay=self.weight_decay)
+        if self.optimizer == "Madgrad":
+            return MADGRAD(
+                params, lr=self.lr, momentum=0.9, weight_decay=self.weight_decay,
+            )
+        raise ValueError(f"Unknown optimizer: {self.optimizer}")
 
-                if self.finetuning_method == "full_sawtooth":
-                    optimizer = torch.optim.AdamW(
-                        [
-                            {
-                                "params": head_params,
-                                "lr": self.lr,
-                                "weight_decay": self.weight_decay,
-                                "name": head_name,
-                            },
-                            {
-                                "params": encoder_params,
-                                "lr": self.lr,
-                                "weight_decay": self.weight_decay,
-                                "name": "encoder",
-                            },
-                        ]
-                    )
+    def _build_sam_optimizer(self, params):
+        # ASAM paper suggests 10x larger rho for adaptive SAM than normal SAM
+        rho = 0.5 if self.adaptive_sam else 0.05
+        common = dict(
+            adaptive=self.adaptive_sam, lr=self.lr,
+            weight_decay=self.weight_decay, rho=rho,
+        )
 
-                else:
-                    optimizer = torch.optim.AdamW(
-                        params, lr=self.lr, weight_decay=self.weight_decay
-                    )
-            elif self.optimizer == "Rmsprop":
+        if self.optimizer == "SGD":
+            return SAM(
+                params, torch.optim.SGD, momentum=0.9, nesterov=self.nesterov,
+                **common,
+            )
+        if self.optimizer == "Madgrad":
+            return SAM(params, MADGRAD, momentum=0.9, **common)
+        if self.optimizer == "Adam":
+            return SAM(params, torch.optim.Adam, **common)
+        if self.optimizer == "AdamW":
+            return SAM(params, torch.optim.AdamW, **common)
+        if self.optimizer == "Rmsprop":
+            return SAM(params, RMSpropTF, **common)
+        raise ValueError(f"Unknown optimizer for SAM: {self.optimizer}")
 
-                if self.finetuning_method == "full_sawtooth":
-                    optimizer = RMSpropTF(
-                        [
-                            {
-                                "params": head_params,
-                                "lr": self.lr,
-                                "weight_decay": self.weight_decay,
-                                "name": head_name,
-                            },
-                            {
-                                "params": encoder_params,
-                                "lr": self.lr,
-                                "weight_decay": self.weight_decay,
-                                "name": "encoder",
-                            },
-                        ]
-                    )
-
-                else:
-                    optimizer = RMSpropTF(
-                        params, lr=self.lr, weight_decay=self.weight_decay
-                    )
-            elif self.optimizer == "Madgrad":
-
-                if self.finetuning_method == "full_sawtooth":
-                    optimizer = MADGRAD(
-                        [
-                            {
-                                "params": head_params,
-                                "lr": self.lr,
-                                "momentum": 0.9,
-                                "weight_decay": self.weight_decay,
-                                "name": head_name,
-                            },
-                            {
-                                "params": encoder_params,
-                                "lr": self.lr,
-                                "momentum": 0.9,
-                                "weight_decay": self.weight_decay,
-                                "name": "encoder",
-                            },
-                        ]
-                    )
-
-                else:
-                    optimizer = MADGRAD(
-                        params, lr=self.lr, momentum=0.9, weight_decay=self.weight_decay
-                    )
-
-        else:
-            # ASAM paper suggests 10x larger rho for adaptive SAM than in normal SAM
-            rho = 0.5 if self.adaptive_sam else 0.05
-
-            if self.optimizer == "SGD":
-                base_optimizer = torch.optim.SGD
-                optimizer = SAM(
-                    params,
-                    base_optimizer,
-                    adaptive=self.adaptive_sam,
-                    lr=self.lr,
-                    momentum=0.9,
-                    weight_decay=self.weight_decay,
-                    nesterov=self.nesterov,
-                    rho=rho,
-                )
-            elif self.optimizer == "Madgrad":
-                base_optimizer = MADGRAD
-                optimizer = SAM(
-                    params,
-                    base_optimizer,
-                    adaptive=self.adaptive_sam,
-                    lr=self.lr,
-                    momentum=0.9,
-                    weight_decay=self.weight_decay,
-                    rho=rho,
-                )
-            elif self.optimizer == "Adam":
-                base_optimizer = torch.optim.Adam
-                optimizer = SAM(
-                    params,
-                    base_optimizer,
-                    adaptive=self.adaptive_sam,
-                    lr=self.lr,
-                    weight_decay=self.weight_decay,
-                    rho=rho,
-                )
-            elif self.optimizer == "AdamW":
-                base_optimizer = torch.optim.AdamW
-                optimizer = SAM(
-                    params,
-                    base_optimizer,
-                    adaptive=self.adaptive_sam,
-                    lr=self.lr,
-                    weight_decay=self.weight_decay,
-                    rho=rho,
-                )
-            elif self.optimizer == "Rmsprop":
-                base_optimizer = RMSpropTF
-                optimizer = SAM(
-                    params,
-                    base_optimizer,
-                    adaptive=self.adaptive_sam,
-                    lr=self.lr,
-                    weight_decay=self.weight_decay,
-                    rho=rho,
-                )
-
+    def _build_scheduler(self, optimizer):
         if not self.scheduler:
-            return [optimizer]
+            return None
+
+        if self.scheduler == "CosineAnneal":
+            if self.warmstart == 0:
+                return torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=self.T_max,
+                )
+            if self.finetuning_method == "full_sawtooth":
+                print(
+                    f"[INFO] Using CosineAnnealingLR_DoubleWarmstart: "
+                    f"warmstart1={self.warmstart}, warmstart2={self.warmstart2}, "
+                    f"T_max={self.T_max}"
+                )
+                return CosineAnnealingLR_DoubleWarmstart(
+                    optimizer, T_max=self.T_max,
+                    warmstart1=self.warmstart, warmstart2=self.warmstart2,
+                )
+            print(
+                f"[INFO] Using CosineAnnealingLR_Warmstart: "
+                f"warmstart1={self.warmstart}, T_max={self.T_max}"
+            )
+            return CosineAnnealingLR_Warmstart(
+                optimizer, T_max=self.T_max, warmstart=self.warmstart,
+            )
+
+        if self.scheduler == "Step":
+            # Decay every quarter of total epochs
+            return torch.optim.lr_scheduler.StepLR(
+                optimizer, step_size=self.epochs // 4, gamma=0.1,
+            )
+        if self.scheduler == "MultiStep":
+            # Decay at half and three-quarters of training
+            return torch.optim.lr_scheduler.MultiStepLR(
+                optimizer, [self.epochs // 2, self.epochs * 3 // 4],
+            )
+
+        raise ValueError(f"Unknown scheduler: {self.scheduler}")
+
+    def configure_optimizers(self):
+        # Note from original: leave bias and BN params undecayed
+        # (https://arxiv.org/pdf/1812.01187.pdf, Bag of Tricks).
+        params = self._build_param_groups()
+
+        if self.sam:
+            optimizer = self._build_sam_optimizer(params)
         else:
-            if self.scheduler == "CosineAnneal" and self.warmstart == 0:
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, T_max=self.T_max
-                )
-            elif self.scheduler == "CosineAnneal" and self.warmstart > 0:
-                if self.finetuning_method == "full_sawtooth":
-                    scheduler = CosineAnnealingLR_DoubleWarmstart(
-                        optimizer,
-                        T_max=self.T_max,
-                        warmstart1=self.warmstart,
-                        warmstart2=self.warmstart2,
-                    )
-                    print(f"[INFO] Using CosineAnnealingLR_DoubleWarmstart: warmstart1={self.warmstart}, warmstart2={self.warmstart2}, T_max={self.T_max}")
-                else:
-                    scheduler = CosineAnnealingLR_Warmstart(
-                        optimizer,
-                        T_max=self.T_max,
-                        warmstart=self.warmstart,
-                    )
-                    print(f"[INFO] Using CosineAnnealingLR_Warmstart: warmstart1={self.warmstart}, T_max={self.T_max}")
-            elif self.scheduler == "Step":
-                # decays every 1/4 epochs
-                scheduler = torch.optim.lr_scheduler.StepLR(
-                    optimizer, step_size=self.epochs // 4, gamma=0.1
-                )
-            elif self.scheduler == "MultiStep":
-                # decays lr with 0.1 after half of epochs and 3/4 of epochs
-                scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                    optimizer, [self.epochs // 2, self.epochs * 3 // 4]
-                )
+            optimizer = self._build_optimizer(params)
 
-            return [optimizer], [scheduler]
+        scheduler = self._build_scheduler(optimizer)
+        if scheduler is None:
+            return [optimizer]
+        return [optimizer], [scheduler]
 
+
+# ---------------------------------------------------------------------------
+# Schedulers
+# ---------------------------------------------------------------------------
 
 class CosineAnnealingLR_Warmstart(_LRScheduler):
     """
-    Same as CosineAnnealingLR but includes a warmstart option that will gradually increase the LR
-    for the amount of specified warmup epochs as described in https://arxiv.org/pdf/1706.02677.pdf
+    CosineAnnealingLR with a linear warmup phase. See
+    https://arxiv.org/pdf/1706.02677.pdf.
     """
 
     def __init__(
-            self, optimizer, T_max, eta_min=0, last_epoch=-1, verbose=False, warmstart=0
+        self, optimizer, T_max, eta_min=0, last_epoch=-1, verbose=False, warmstart=0,
     ):
-        self.T_max = T_max - warmstart  # do not consider warmstart epochs for T_max
+        self.T_max = T_max - warmstart  # warmup epochs not part of cosine period
         self.eta_min = eta_min
         self.warmstart = warmstart
         self.T = 0
-
-        super(CosineAnnealingLR_Warmstart, self).__init__(
-            optimizer, last_epoch #, verbose
-        )
+        super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         if not self._get_lr_called_within_step:
             warnings.warn(
-                "To get the last learning rate computed by the scheduler, please use `get_last_lr()`.",
+                "To get the last learning rate computed by the scheduler, "
+                "please use `get_last_lr()`.",
                 UserWarning,
             )
 
-        # Warmstart
+        # Warmup
         if self.last_epoch < self.warmstart:
-            addrates = [(lr / (self.warmstart + 1)) for lr in self.base_lrs]
-            updated_lr = [
+            addrates = [lr / (self.warmstart + 1) for lr in self.base_lrs]
+            return [
                 addrates[i] * (self.last_epoch + 1)
-                for i, group in enumerate(self.optimizer.param_groups)
+                for i, _ in enumerate(self.optimizer.param_groups)
             ]
 
-            return updated_lr
+        # Cosine annealing
+        if self.T == 0:
+            self.T += 1
+            return self.base_lrs
 
-        else:
-            if self.T == 0:
-                self.T += 1
-                return self.base_lrs
-            elif (self.T - 1 - self.T_max) % (2 * self.T_max) == 0:
-                updated_lr = [
-                    group["lr"]
-                    + (base_lr - self.eta_min)
-                    * (1 - math.cos(math.pi / self.T_max))
-                    / 2
-                    for base_lr, group in zip(
-                        self.base_lrs, self.optimizer.param_groups
-                    )
-                ]
-
-                self.T += 1
-                return updated_lr
-
+        if (self.T - 1 - self.T_max) % (2 * self.T_max) == 0:
             updated_lr = [
-                (1 + math.cos(math.pi * self.T / self.T_max))
-                / (1 + math.cos(math.pi * (self.T - 1) / self.T_max))
-                * (group["lr"] - self.eta_min)
-                + self.eta_min
-                for group in self.optimizer.param_groups
+                group["lr"]
+                + (base_lr - self.eta_min)
+                * (1 - math.cos(math.pi / self.T_max))
+                / 2
+                for base_lr, group in zip(self.base_lrs, self.optimizer.param_groups)
             ]
-
             self.T += 1
             return updated_lr
+
+        updated_lr = [
+            (1 + math.cos(math.pi * self.T / self.T_max))
+            / (1 + math.cos(math.pi * (self.T - 1) / self.T_max))
+            * (group["lr"] - self.eta_min)
+            + self.eta_min
+            for group in self.optimizer.param_groups
+        ]
+        self.T += 1
+        return updated_lr
 
 
 class CosineAnnealingLR_DoubleWarmstart(_LRScheduler):
     """
-    CosineAnnealingLR with two consecutive warmup phases.
+    Two consecutive linear warmup phases followed by cosine annealing.
 
-    - Warmup 1: Increases LR from 0 to base LR, **only for `cls_head`**.
-    - Warmup 2: Increases LR from 0 to base LR, **for both `cls_head` and `encoder`**.
-    - Cosine Annealing: Decays LR **for both `cls_head` and `encoder`**.
+    - Phase 1 (warmstart1 epochs): only the head warms up; encoder LR stays at 0.
+    - Phase 2 (warmstart2 epochs): both head and encoder warm up.
+    - Cosine annealing decays both groups.
     """
 
     def __init__(
-            self,
-            optimizer,
-            T_max,
-            eta_min=0,
-            last_epoch=-1,
-            verbose=False,
-            warmstart1=0,
-            warmstart2=0,
+        self,
+        optimizer,
+        T_max,
+        eta_min=0,
+        last_epoch=-1,
+        verbose=False,
+        warmstart1=0,
+        warmstart2=0,
     ):
         self.warmstart1 = warmstart1
         self.warmstart2 = warmstart2
         self.eta_min = eta_min
-        self.T_max = T_max - (warmstart1 + warmstart2)  # Effective decay period
-        self.T = 0  # Internal counter
+        self.T_max = T_max - (warmstart1 + warmstart2)  # cosine decay period
+        self.T = 0  # internal counter (unused, kept for parity)
 
-        # Identify param groups: assume "cls_head" and "encoder" are named properly in optimizer param_groups
-        # Identify param groups: support either 'cls_head' or 'reg_head'
+        # Locate parameter groups by name; either "cls_head" or "reg_head" works.
         self.head_group = None
         self.encoder_group = None
-
         for param_group in optimizer.param_groups:
-            if param_group.get("name") in ["cls_head", "reg_head"]:
+            name = param_group.get("name")
+            if name in ("cls_head", "reg_head"):
                 self.head_group = param_group
-            elif param_group.get("name") == "encoder":
+            elif name == "encoder":
                 self.encoder_group = param_group
 
         if self.head_group is None:
-            raise ValueError("Optimizer must have a parameter group named 'cls_head' or 'reg_head'.")
+            raise ValueError(
+                "Optimizer must have a parameter group named 'cls_head' or 'reg_head'."
+            )
         if self.encoder_group is None:
             raise ValueError("Optimizer must have a parameter group named 'encoder'.")
 
-        super().__init__(
-            optimizer, last_epoch
-        )
+        super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         if not self._get_lr_called_within_step:
             warnings.warn(
-                "To get the last learning rate computed by the scheduler, please use `get_last_lr()`.",
+                "To get the last learning rate computed by the scheduler, "
+                "please use `get_last_lr()`.",
                 UserWarning,
             )
 
         warmup_total = self.warmstart1 + self.warmstart2
 
-        # First warmup phase (only `cls_head` is trained)
+        # Phase 1: warm up the head only.
         if self.last_epoch < self.warmstart1:
-            warmup_factor = (self.last_epoch + 1) / self.warmstart1
-            updated_lr = []
+            # Bug fix: guard against warmstart1 == 0 (would div-by-zero, though
+            # the branch wouldn't be taken with warmstart1 == 0 anyway).
+            denom = max(self.warmstart1, 1)
+            warmup_factor = (self.last_epoch + 1) / denom
+            return [
+                group["initial_lr"] * warmup_factor if group is self.head_group else 0
+                for group in self.optimizer.param_groups
+            ]
 
-            for group in self.optimizer.param_groups:
-                if group is self.head_group:
-                    updated_lr.append(group["initial_lr"] * warmup_factor)
-                else:  # Keep encoder frozen
-                    updated_lr.append(0)
-
-            return updated_lr
-
-        # Second warmup phase (both `cls_head` and `encoder` are trained)
-        elif self.last_epoch < warmup_total:
-            warmup_factor = (self.last_epoch - self.warmstart1 + 1) / self.warmstart2
-            updated_lr = [
+        # Phase 2: warm up both head and encoder.
+        if self.last_epoch < warmup_total:
+            # Bug fix: guard against warmstart2 == 0.
+            denom = max(self.warmstart2, 1)
+            warmup_factor = (self.last_epoch - self.warmstart1 + 1) / denom
+            return [
                 group["initial_lr"] * warmup_factor
                 for group in self.optimizer.param_groups
             ]
-            return updated_lr
 
-        # Cosine annealing phase (both `cls_head` and `encoder`)
-        else:
-            epoch_cosine = self.last_epoch - warmup_total  # Shifted epoch count
-            updated_lr = [
-                self.eta_min
-                + (group["initial_lr"] - self.eta_min)
-                * 0.5
-                * (1 + math.cos(math.pi * epoch_cosine / self.T_max))
-                for group in self.optimizer.param_groups
-            ]
-            return updated_lr
+        # Cosine annealing for both groups.
+        epoch_cosine = self.last_epoch - warmup_total
+        return [
+            self.eta_min
+            + (group["initial_lr"] - self.eta_min)
+            * 0.5
+            * (1 + math.cos(math.pi * epoch_cosine / self.T_max))
+            for group in self.optimizer.param_groups
+        ]
 
+
+# ---------------------------------------------------------------------------
+# Generic wrapper
+# ---------------------------------------------------------------------------
 
 class ModelConstructor(BaseModel):
     def __init__(self, model, **kwargs):
-        super(ModelConstructor, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         self.model = model
 
     def forward(self, x):
-        out = self.model(x)
-        return out
+        return self.model(x)
