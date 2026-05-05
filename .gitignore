@@ -112,3 +112,4 @@ checkpoints/
 *.pt
 *.pth
 *.tar.gz
+lightning_logs/

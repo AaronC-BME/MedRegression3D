@@ -7,7 +7,8 @@ import torch.distributed as dist
 
 from base_model import BaseModel
 from models.classification_head import ClassificationHead
-from models.ordinal_regression_head import OrdinalRegressionHead, OrdinalRegressionHead_MLP  # <-- use your new head
+from models.regression_head import RegressionHead
+from models.ordinal_regression_head import OrdinalRegressionHead, OrdinalRegressionHead_MLP
 
 
 def get_first_valid_key(d, keys):
@@ -95,6 +96,44 @@ class ResEncoder_Classifier(BaseModel):
 
         return x
 
+
+class ResEncoder_Regressor(BaseModel):
+    """ResEncoder backbone with a plain regression head.
+
+    Use with ``task: 'Regression'``. By default the head emits a single scalar
+    per sample (output shape ``[B]``); set ``num_outputs`` in the model config
+    for multi-output regression.
+    """
+
+    def __init__(self, **hypparams):
+        super().__init__(**hypparams)
+
+        self.encoder = ResEncoder(**hypparams)
+
+        self.reg_head = RegressionHead(
+            embed_dim=320,
+            num_outputs=hypparams.get("num_outputs", 1),
+            dropout=hypparams.get("classification_head_dropout", 0.1),
+            patch_aggregation_method=hypparams.get("token_aggregation_method", "avg"),
+            cls_token_available=False,
+        )
+
+        # Optionally restore reg_head weights from a checkpoint that was saved
+        # with the same head shape.
+        if hypparams.get("pretrained", False):
+            ckpt = torch.load(hypparams["chpt_path"], map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt)
+
+            for name, param in state_dict.items():
+                if name.startswith("reg_head") and name in self.state_dict():
+                    if self.state_dict()[name].shape == param.shape:
+                        self.state_dict()[name].copy_(param)
+
+    def forward(self, x):
+        x = self.encoder(x)
+        return self.reg_head(x)
+
+
 class ResEncoder_OrdinalRegressor(BaseModel):
     def __init__(self, **hypparams):
         super().__init__(**hypparams)
@@ -110,27 +149,21 @@ class ResEncoder_OrdinalRegressor(BaseModel):
             cls_token_available=False,
         )
 
-        # ✅ Only load reg_head if weights are available
+        # Only load reg_head if weights are available
         if hypparams.get("pretrained", False):
             ckpt = torch.load(hypparams["chpt_path"], map_location="cpu")
             state_dict = ckpt.get("state_dict", ckpt)
 
-            loaded_keys = []
             for name, param in state_dict.items():
                 if name.startswith("reg_head") and name in self.state_dict():
                     if self.state_dict()[name].shape == param.shape:
                         self.state_dict()[name].copy_(param)
-                        loaded_keys.append(name)
-
-            # if loaded_keys:
-            #     print(f"✅ reg_head weights loaded: {len(loaded_keys)} params")
-            # else:
-            #     print("⚠️ No reg_head weights found in checkpoint — randomly initialized.")
 
     def forward(self, x):
         x = self.encoder(x)
         logits, probas = self.reg_head(x)
         return logits, probas
+
 
 class ResEncoder_OrdinalRegressor_MLP(BaseModel):
     def __init__(self, **hypparams):
@@ -147,27 +180,11 @@ class ResEncoder_OrdinalRegressor_MLP(BaseModel):
             cls_token_available=False,
         )
 
-        # # ✅ Only load reg_head if weights are available
-        # if hypparams.get("pretrained", False):
-        #     ckpt = torch.load(hypparams["chpt_path"], map_location="cpu")
-        #     state_dict = ckpt.get("state_dict", ckpt)
-
-        #     loaded_keys = []
-        #     for name, param in state_dict.items():
-        #         if name.startswith("reg_head") and name in self.state_dict():
-        #             if self.state_dict()[name].shape == param.shape:
-        #                 self.state_dict()[name].copy_(param)
-        #                 loaded_keys.append(name)
-
-        #     if loaded_keys:
-        #         print(f"✅ reg_head weights loaded: {len(loaded_keys)} params")
-        #     else:
-        #         print("⚠️ No reg_head weights found in checkpoint — randomly initialized.")
-
     def forward(self, x):
         x = self.encoder(x)
         logits, probas = self.reg_head(x)
         return logits, probas
+
 
 def load_pretrained_weights(
     resenc_model,
@@ -182,10 +199,8 @@ def load_pretrained_weights(
     else:
         saved_model = torch.load(pretrained_weights_file, weights_only=False)
     if 'network_weights' in saved_model:
-        # print("Loaded weights from 'network_weights'")
         pretrained_dict = saved_model['network_weights']
     elif 'state_dict' in saved_model:
-        # print("Loaded weights from 'state_dict'")
         pretrained_dict = saved_model['state_dict']
     else:
         raise KeyError("No compatible weight dictionary ('network_weights' or 'state_dict') found in checkpoint")
@@ -225,7 +240,6 @@ def load_pretrained_weights(
         target_data_ptr = in_conv_weights_pretrained.data_ptr()
         for key, weights in pretrained_dict.items():
             if weights.data_ptr() == target_data_ptr:
-                # print(key)
                 pretrained_dict[key] = repeated_weight_tensor
 
         # SPECIAL CASE HARDCODE INCOMING
@@ -269,12 +283,6 @@ def load_pretrained_weights(
 
     model_dict.update(final_pretrained_dict)
 
-    # print("################### Loading pretrained weights from file ", fname, '###################')
-    # print("Below is the list of overlapping blocks in pretrained model and nnUNet architecture:")
-    # for key, value in final_pretrained_dict.items():
-    #     print(key, 'shape', value.shape)
-    # print("################### Done ###################")
-    # exit()
     mod.load_state_dict(model_dict)
 
     return mod
