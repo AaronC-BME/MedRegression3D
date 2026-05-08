@@ -10,8 +10,39 @@ The main additions over upstream:
 - Inference script `inference_ord_reg_last_ckpt.py` for ordinal regression checkpoints.
 
 # Installation
-## Requirements
-Install the requirements in a [virtual environment](https://conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html) by:
+
+This project can be installed with either `pip` (in a virtualenv or conda env) or [`uv`](https://docs.astral.sh/uv/) — a faster Python package manager. Both result in the same set of installed packages.
+
+## Option 1: uv (recommended)
+
+[uv](https://docs.astral.sh/uv/) is significantly faster than pip and handles the Python interpreter for you.
+
+```shell
+# Install uv (if not already)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# From inside the cloned repo
+uv venv --python 3.11
+source .venv/bin/activate
+
+# Install PyTorch matching your CUDA driver (auto-detected)
+uv pip install torch torchvision --torch-backend=auto
+
+# Install the rest of the requirements
+uv pip install -r requirements.txt
+```
+
+You can also pin a specific CUDA build explicitly if `--torch-backend=auto` doesn't pick what you want:
+
+```shell
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+```
+
+To deactivate the env later, run `deactivate`. To resume work, `cd` into the repo and `source .venv/bin/activate` again.
+
+## Option 2: pip
+
+Install the requirements in a [virtual environment](https://conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html):
 
 ```shell
 pip install -r requirements.txt
@@ -19,6 +50,14 @@ pip install -r requirements.txt
 
 You might need to adapt the cuda versions for torch and torchvision.
 Find a torch installation guide for your system [here](https://pytorch.org/get-started/locally/).
+
+## Verifying the install
+
+```shell
+python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available(), 'devices:', torch.cuda.device_count())"
+```
+
+You should see your torch version, `cuda: True`, and a non-zero device count if you have a GPU available.
 
 
 # Dataset preprocessing
