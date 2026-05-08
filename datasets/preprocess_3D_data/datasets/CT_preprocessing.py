@@ -1,0 +1,320 @@
+"""
+General-purpose CT preprocessing for SSL3D_regression.
+
+Reads raw NIfTI CT images, computes dataset-wide intensity statistics on the
+foreground (HU > -500), then for each case:
+  1. Resamples to a target spacing (default 1mm isotropic).
+  2. Crops to the non-zero bounding box (matches nnssl behavior).
+  3. Applies CT normalization (clip to dataset percentiles + dataset z-score).
+  4. Saves as Blosc2 in the directory layout the AgeReg dataloader expects:
+        <out_root>/<dataset-name>/<dataset-name>/<id>/ses-DEFAULT/<id>.b2nd
+
+Notes:
+  - This script is dataset-agnostic. Use --dataset-name to set the folder.
+  - Resampling order is 3 (cubic) for CT data, matching the SSL3D template.
+  - If your data is already at the target spacing, resampling is a near-no-op
+    (one short shape check) and adds negligible time. Pass --skip-resample to
+    skip it explicitly.
+  - Random patch extraction to 160^3 happens at training time via
+    batchgenerators, not here. We preserve full resampled volumes.
+
+Usage:
+    python CT_preprocessing.py \\
+        --in-dir /home/jma/Documents/AgingCT/liverROIs/images \\
+        --out-root $nnssl_preprocessed/Dataset001_LiverROI/nnsslPlans_onemmiso \\
+        --dataset-name Dataset001_LiverROI \\
+        --target-spacing 1 1 1 \\
+        --num-workers 8 \\
+        --stats-cache $nnssl_preprocessed/Dataset001_LiverROI/ct_intensity_stats.json
+"""
+import sys
+import os
+import argparse
+import json
+from multiprocessing import Pool
+from pathlib import Path
+from typing import Optional, Tuple, List
+
+# Make the parent package importable when running this script directly,
+# matching the pattern used by template_brain_preprocessing.py.
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+)
+
+import numpy as np
+import SimpleITK as sitk
+from tqdm import tqdm
+
+from datasets.preprocess_3D_data.cropping import crop_to_nonzero
+from datasets.preprocess_3D_data.normalization import CTNormalization
+from datasets.preprocess_3D_data.blosc_helper import save_case, comp_blosc2_params
+from datasets.preprocess_3D_data.default_resampling import resample_data_or_seg_to_spacing
+
+SESSION_ID = "ses-DEFAULT"
+
+# CT-specific: voxels above this HU threshold count as foreground (tissue).
+# Air -1000, lung parenchyma -800, fat -100, water 0, soft tissue +30 to +60,
+# bone +400 and up. -500 cleanly separates air/lung from everything else.
+CT_FOREGROUND_HU_THRESHOLD = -500.0
+
+# How many foreground voxels to sample per case when computing dataset stats.
+# 10000 matches nnU-Net's default. Subsampling keeps memory bounded; the
+# percentiles and mean/std are accurate to within rounding error.
+NUM_FOREGROUND_SAMPLES_PER_CASE = 10_000
+
+# Cubic interpolation for CT image data. Matches SSL3D template default.
+RESAMPLING_ORDER = 3
+
+
+# --------------------------------------------------------------------------- #
+# Stats computation (Pass 1)
+# --------------------------------------------------------------------------- #
+def _sample_foreground_one_case(image_path: str) -> np.ndarray:
+    """
+    Load one NIfTI and return up to NUM_FOREGROUND_SAMPLES_PER_CASE
+    foreground (HU > -500) voxel samples.
+
+    Stats are computed on the *raw* (pre-resample) volume. This is correct
+    because resampling preserves intensity distribution, and computing on raw
+    data avoids double-paying the resample cost.
+    """
+    img = sitk.ReadImage(image_path)
+    data = sitk.GetArrayFromImage(img)  # (Z, Y, X), HU values
+    foreground = data[data > CT_FOREGROUND_HU_THRESHOLD]
+    if foreground.size == 0:
+        # Degenerate case (volume is mostly air?) - fall back to non-zero
+        foreground = data[data != 0]
+    if foreground.size == 0:
+        return np.empty((0,), dtype=np.float32)
+
+    if foreground.size > NUM_FOREGROUND_SAMPLES_PER_CASE:
+        # Deterministic per-file seed so the stats are reproducible
+        rng = np.random.default_rng(seed=hash(image_path) & 0xFFFFFFFF)
+        idx = rng.choice(foreground.size, size=NUM_FOREGROUND_SAMPLES_PER_CASE, replace=False)
+        foreground = foreground[idx]
+    return foreground.astype(np.float32)
+
+
+def compute_dataset_stats(
+    image_paths: List[str],
+    num_workers: int = 8,
+) -> dict:
+    """
+    Compute dataset-wide foreground intensity statistics for CT normalization.
+    Returns a dict with keys: mean, std, median, min, max, percentile_00_5,
+    percentile_99_5.
+    """
+    print(f"Computing CT intensity stats from {len(image_paths)} images...")
+    if num_workers > 1:
+        with Pool(processes=num_workers) as pool:
+            samples_per_case = list(
+                tqdm(pool.imap_unordered(_sample_foreground_one_case, image_paths),
+                     total=len(image_paths))
+            )
+    else:
+        samples_per_case = [_sample_foreground_one_case(p) for p in tqdm(image_paths)]
+
+    samples_per_case = [s for s in samples_per_case if s.size > 0]
+    if not samples_per_case:
+        raise RuntimeError("Could not extract any foreground voxels from any case.")
+
+    all_samples = np.concatenate(samples_per_case)
+    stats = {
+        "mean": float(np.mean(all_samples)),
+        "std": float(np.std(all_samples)),
+        "median": float(np.median(all_samples)),
+        "min": float(np.min(all_samples)),
+        "max": float(np.max(all_samples)),
+        "percentile_00_5": float(np.percentile(all_samples, 0.5)),
+        "percentile_99_5": float(np.percentile(all_samples, 99.5)),
+    }
+    return stats
+
+
+# --------------------------------------------------------------------------- #
+# Per-case processing (Pass 2)
+# --------------------------------------------------------------------------- #
+def process_one_case(args: tuple) -> Optional[str]:
+    """
+    Worker function. Takes a tuple so it works with Pool.imap.
+    Returns the case ID on success, None on failure.
+
+    Pipeline order matters here:
+        1. Load
+        2. Resample to target spacing (changes voxel grid, preserves anatomy)
+        3. Crop to nonzero (safe to do after resampling - bbox tracks anatomy)
+        4. Normalize using dataset stats
+        5. Save
+    """
+    image_path, output_dir_for_case, intensity_properties, target_spacing, skip_resample = args
+    case_id = Path(output_dir_for_case).parent.name  # e.g. "AC421367a"
+
+    try:
+        # ---- 1. Load ----
+        img = sitk.ReadImage(image_path)
+        # SimpleITK GetSpacing returns (x, y, z); array is (z, y, x) — invert.
+        original_spacing = img.GetSpacing()[::-1]
+        data = sitk.GetArrayFromImage(img)  # (Z, Y, X)
+
+        # Add channel dim for compatibility with cropping/resampling utilities
+        data = data[np.newaxis, ...].astype(np.float32, copy=False)  # (1, Z, Y, X)
+
+        # Sanity check
+        if np.any(np.isnan(data)) or np.any(np.isinf(data)):
+            print(f"[skip] {case_id}: NaN/Inf in input")
+            return None
+
+        # ---- 2. Resample to target spacing ----
+        if not skip_resample:
+            target = list(target_spacing)
+            # Skip the resample if already at target spacing (saves time, avoids
+            # unnecessary interpolation noise).
+            already_target = all(
+                abs(o - t) < 1e-3 for o, t in zip(original_spacing, target)
+            )
+            if not already_target:
+                data = resample_data_or_seg_to_spacing(
+                    data,
+                    original_spacing,
+                    target,
+                    is_seg=False,
+                    order=RESAMPLING_ORDER,
+                )
+
+        # ---- 3. Crop to non-zero bounding box ----
+        # For CT this typically only trims explicitly zero-padded edges. Real
+        # tissue has nonzero HU values so it survives the crop.
+        data, _seg, _bbox = crop_to_nonzero(data, seg=None)
+
+        # ---- 4. CT-normalize using dataset-wide stats ----
+        normalizer = CTNormalization()
+        normalizer.intensityproperties = intensity_properties
+        data = normalizer.run(data)
+
+        # ---- 5. Save as Blosc2 ----
+        os.makedirs(output_dir_for_case, exist_ok=True)
+        out_path_truncated = os.path.join(output_dir_for_case, case_id)
+        block_size, chunk_size = comp_blosc2_params(
+            data.shape, (160, 160, 160), data.itemsize
+        )
+        save_case(data, out_path_truncated, chunks=chunk_size, blocks=block_size)
+
+        return case_id
+
+    except Exception as e:
+        print(f"[error] {case_id}: {e}")
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Driver
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--in-dir", required=True, type=Path,
+                        help="Directory containing raw .nii.gz CT images.")
+    parser.add_argument("--out-root", required=True, type=Path,
+                        help="Output root, e.g. .../nnsslPlans_onemmiso. "
+                             "The script will write to <out-root>/<dataset-name>/<dataset-name>/<id>/ses-DEFAULT/<id>.b2nd")
+    parser.add_argument("--dataset-name", required=True, type=str,
+                        help="Name of the dataset folder, e.g. Dataset001_LiverROI.")
+    parser.add_argument("--target-spacing", type=float, nargs=3,
+                        default=[1.0, 1.0, 1.0], metavar=("Z", "Y", "X"),
+                        help="Target spacing in mm as three floats: Z Y X. Default: 1 1 1.")
+    parser.add_argument("--skip-resample", action="store_true",
+                        help="Skip resampling entirely (use the data as-is).")
+    parser.add_argument("--num-workers", type=int, default=8,
+                        help="Number of parallel processes. Default: 8")
+
+    # Optional pre-supplied stats (skip the dataset scan)
+    parser.add_argument("--stats-mean", type=float, default=None)
+    parser.add_argument("--stats-std", type=float, default=None)
+    parser.add_argument("--stats-pct-00-5", type=float, default=None)
+    parser.add_argument("--stats-pct-99-5", type=float, default=None)
+    parser.add_argument("--stats-cache", type=Path, default=None,
+                        help="Path to write/read intensity stats as JSON. If set and the file "
+                             "exists, the stats are loaded from it instead of recomputed.")
+
+    args = parser.parse_args()
+
+    if not args.in_dir.is_dir():
+        raise SystemExit(f"--in-dir does not exist: {args.in_dir}")
+
+    image_paths = sorted(str(p) for p in args.in_dir.glob("*.nii.gz"))
+    if not image_paths:
+        raise SystemExit(f"No .nii.gz files found in {args.in_dir}")
+
+    print(f"Found {len(image_paths)} CT images.")
+    if args.skip_resample:
+        print("[note] --skip-resample set. Volumes will be saved at their native spacing.")
+    else:
+        print(f"[note] target spacing (Z Y X): {tuple(args.target_spacing)} mm")
+
+    # ---- Resolve intensity stats ---- #
+    have_args_stats = all(
+        v is not None for v in [args.stats_mean, args.stats_std, args.stats_pct_00_5, args.stats_pct_99_5]
+    )
+
+    if have_args_stats:
+        intensity_properties = {
+            "mean": args.stats_mean,
+            "std": args.stats_std,
+            "percentile_00_5": args.stats_pct_00_5,
+            "percentile_99_5": args.stats_pct_99_5,
+        }
+        print(f"Using user-supplied stats: {intensity_properties}")
+    elif args.stats_cache is not None and args.stats_cache.is_file():
+        with open(args.stats_cache) as f:
+            intensity_properties = json.load(f)
+        print(f"Loaded cached stats from {args.stats_cache}: {intensity_properties}")
+    else:
+        intensity_properties = compute_dataset_stats(image_paths, num_workers=args.num_workers)
+        print("Computed stats:")
+        for k, v in intensity_properties.items():
+            print(f"  {k:>20s}: {v:.4f}")
+        if args.stats_cache is not None:
+            args.stats_cache.parent.mkdir(parents=True, exist_ok=True)
+            with open(args.stats_cache, "w") as f:
+                json.dump(intensity_properties, f, indent=2)
+            print(f"Wrote stats cache to {args.stats_cache}")
+
+    # ---- Build per-case output dirs and dispatch ---- #
+    out_root = args.out_root / args.dataset_name / args.dataset_name
+    out_root.mkdir(parents=True, exist_ok=True)
+    print(f"\nWriting outputs to {out_root}/<id>/{SESSION_ID}/<id>.b2nd")
+
+    job_args = []
+    for img_path in image_paths:
+        case_id = Path(img_path).name
+        if case_id.endswith(".nii.gz"):
+            case_id = case_id[:-len(".nii.gz")]
+        elif case_id.endswith(".nii"):
+            case_id = case_id[:-len(".nii")]
+        case_out_dir = str(out_root / case_id / SESSION_ID)
+        job_args.append((
+            img_path,
+            case_out_dir,
+            intensity_properties,
+            tuple(args.target_spacing),
+            args.skip_resample,
+        ))
+
+    print(f"\nProcessing {len(job_args)} cases with {args.num_workers} workers...")
+    if args.num_workers > 1:
+        with Pool(processes=args.num_workers) as pool:
+            results = list(tqdm(pool.imap_unordered(process_one_case, job_args),
+                                total=len(job_args)))
+    else:
+        results = [process_one_case(j) for j in tqdm(job_args)]
+
+    n_ok = sum(1 for r in results if r is not None)
+    n_fail = len(results) - n_ok
+    print(f"\nDone. {n_ok} succeeded, {n_fail} failed.")
+    if n_fail:
+        print("Failed cases were printed above with [error] or [skip] tags.")
+
+
+if __name__ == "__main__":
+    main()

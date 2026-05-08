@@ -1,10 +1,13 @@
 import glob
+import glob
 import os
 from pathlib import Path
 
 import hydra
+import numpy as np
 import pandas as pd
 import torch
+import matplotlib.pyplot as plt
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
@@ -56,6 +59,130 @@ def _compute_metrics(preds, targets):
     return {"N": n, "MAE": mae, "RMSE": rmse, "MeanError": me, "Pearson_r": pearson}
 
 
+def _bin_errors_by_age(targets, preds, bin_width=10, max_age=100):
+    """
+    Group prediction errors into age bins of `bin_width` years based on the
+    ground-truth age. Returns a DataFrame indexed by bin label with columns:
+        N, MAE, RMSE, MeanError, StdError
+    Bins are [0, 10), [10, 20), ..., up to max_age. Anything >= max_age is
+    grouped into a final ">=max_age" bin (kept for safety; usually empty).
+    """
+    targets_np = targets.detach().cpu().numpy().astype(float)
+    preds_np = preds.detach().cpu().numpy().astype(float)
+    err_np = preds_np - targets_np
+    abs_err_np = np.abs(err_np)
+
+    edges = np.arange(0, max_age + bin_width, bin_width)  # [0, 10, 20, ..., max_age]
+    labels = [f"{int(edges[i])}-{int(edges[i + 1]) - 1}" for i in range(len(edges) - 1)]
+
+    rows = []
+    for i, lab in enumerate(labels):
+        lo, hi = edges[i], edges[i + 1]
+        mask = (targets_np >= lo) & (targets_np < hi)
+        n = int(mask.sum())
+        if n == 0:
+            rows.append({"Bin": lab, "N": 0, "MAE": np.nan, "RMSE": np.nan,
+                         "MeanError": np.nan, "StdError": np.nan})
+        else:
+            rows.append({
+                "Bin": lab,
+                "N": n,
+                "MAE": float(abs_err_np[mask].mean()),
+                "RMSE": float(np.sqrt((err_np[mask] ** 2).mean())),
+                "MeanError": float(err_np[mask].mean()),
+                "StdError": float(err_np[mask].std(ddof=1)) if n > 1 else 0.0,
+            })
+
+    # Catch anything at or beyond max_age
+    overflow_mask = targets_np >= max_age
+    n_over = int(overflow_mask.sum())
+    if n_over > 0:
+        rows.append({
+            "Bin": f">={int(max_age)}",
+            "N": n_over,
+            "MAE": float(abs_err_np[overflow_mask].mean()),
+            "RMSE": float(np.sqrt((err_np[overflow_mask] ** 2).mean())),
+            "MeanError": float(err_np[overflow_mask].mean()),
+            "StdError": float(err_np[overflow_mask].std(ddof=1)) if n_over > 1 else 0.0,
+        })
+
+    df = pd.DataFrame(rows)
+    return df
+
+
+def _plot_error_bars(bin_df, title, out_path, metric="MAE"):
+    """
+    Plot a bar chart of the chosen error metric per age bin and save to disk.
+    Empty bins (N=0) are still drawn as gaps. Sample counts (N) are annotated
+    on top of each bar.
+    """
+    fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(bin_df)), 5))
+
+    bins = bin_df["Bin"].tolist()
+    values = bin_df[metric].to_numpy(dtype=float)
+    counts = bin_df["N"].to_numpy(dtype=int)
+
+    # Replace NaN with 0 for plotting but keep track to label them as "n=0"
+    plot_values = np.where(np.isnan(values), 0.0, values)
+
+    bars = ax.bar(bins, plot_values, color="steelblue", edgecolor="black")
+
+    # Annotate each bar with sample count
+    for bar, n, v in zip(bars, counts, values):
+        height = bar.get_height()
+        if n == 0 or np.isnan(v):
+            ax.text(bar.get_x() + bar.get_width() / 2, 0,
+                    "n=0", ha="center", va="bottom", fontsize=8, color="gray")
+        else:
+            ax.text(bar.get_x() + bar.get_width() / 2, height,
+                    f"n={n}\n{v:.2f}", ha="center", va="bottom", fontsize=8)
+
+    ax.set_xlabel("Age bin (years)")
+    ax.set_ylabel(metric + (" (years)" if metric in ("MAE", "RMSE", "MeanError") else ""))
+    ax.set_title(title)
+    ax.grid(axis="y", linestyle="--", alpha=0.5)
+
+    # A horizontal reference line at 0 helps for signed-error plots
+    if metric == "MeanError":
+        ax.axhline(0, color="black", linewidth=0.8)
+
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  saved plot: {out_path}")
+
+
+def _save_bin_report(targets, preds, tag, exp_dir, bin_width=10, max_age=100):
+    """
+    Compute age-binned errors, save them as CSV, and produce MAE / MeanError
+    bar charts. `tag` is used in filenames (e.g. 'fold0', 'ensemble_avg_probas').
+    """
+    bin_df = _bin_errors_by_age(targets, preds, bin_width=bin_width, max_age=max_age)
+
+    csv_path = os.path.join(exp_dir, f"error_by_age_bin_{tag}.csv")
+    bin_df.to_csv(csv_path, index=False)
+    print(f"[{tag}] saved per-bin error stats to {csv_path}")
+
+    mae_plot_path = os.path.join(exp_dir, f"error_by_age_bin_{tag}_MAE.png")
+    _plot_error_bars(
+        bin_df,
+        title=f"MAE per age bin ({tag})",
+        out_path=mae_plot_path,
+        metric="MAE",
+    )
+
+    me_plot_path = os.path.join(exp_dir, f"error_by_age_bin_{tag}_MeanError.png")
+    _plot_error_bars(
+        bin_df,
+        title=f"Mean signed error per age bin ({tag})",
+        out_path=me_plot_path,
+        metric="MeanError",
+    )
+
+    return bin_df
+
+
 @hydra.main(version_base=None, config_path="./cli_configs", config_name="infer")
 def inference(cfg):
     try:
@@ -65,11 +192,51 @@ def inference(cfg):
 
     prefer_best = cfg.get("prefer_best", True)
 
+    # Allow overriding the bin width / max age from the config if desired.
+    bin_width = int(cfg.get("age_bin_width", 10))
+    max_age = int(cfg.get("age_bin_max", 100))
+
     # Gather checkpoints per fold
     if cfg.fold:
         candidate_paths = list(Path(Path(cfg.ckpt_dir) / str(cfg.fold)).glob("*.ckpt"))
         fold_groups = {str(cfg.fold): candidate_paths}
+        candidate_paths = list(Path(Path(cfg.ckpt_dir) / str(cfg.fold)).glob("*.ckpt"))
+        fold_groups = {str(cfg.fold): candidate_paths}
     else:
+        all_paths = list(Path(cfg.ckpt_dir).glob("*/*.ckpt"))
+        fold_groups = {}
+        for p in all_paths:
+            fold_groups.setdefault(p.parent.name, []).append(p)
+
+    if not fold_groups:
+        raise FileNotFoundError(f"No checkpoints found under {cfg.ckpt_dir}")
+
+    # Locate training config
+    matches = glob.glob(os.path.join(cfg.exp_dir, "*/config.yaml"))
+    if not matches:
+        raise FileNotFoundError(
+            f"No config.yaml found under {cfg.exp_dir}/*/config.yaml"
+        )
+    used_training_config_path = matches[0]
+    print(f"Using training config: {used_training_config_path}")
+
+    fold_ids_sorted = sorted(fold_groups.keys(), key=lambda x: (len(x), x))
+
+    summary_rows = []
+    all_probas = []      # one entry per fold: tensor [N, K-1]
+    all_preds = []       # one entry per fold: tensor [N]
+    targets_ref = None
+    patient_ids_ref = None
+
+    for fold_id in fold_ids_sorted:
+        ckp_list = fold_groups[fold_id]
+        ckp_path = _select_best_ckpt(ckp_list, prefer_best=prefer_best)
+        if ckp_path is None:
+            print(f"[fold {fold_id}] no checkpoint found, skipping")
+            continue
+        print(f"[fold {fold_id}] using checkpoint: {ckp_path}")
+
+        # Load training config fresh (we mutate it)
         all_paths = list(Path(cfg.ckpt_dir).glob("*/*.ckpt"))
         fold_groups = {}
         for p in all_paths:
@@ -116,7 +283,20 @@ def inference(cfg):
 
         used_training_cfg.data.module.fold = int(fold_id)
 
+        used_training_cfg.trainer.pop("logger", None)
+        used_training_cfg.trainer.pop("callbacks", None)
+        used_training_cfg.model.metrics = cfg.metrics
+
+        # Force single-device prediction so the test set isn't sharded/padded
+        used_training_cfg.trainer.devices = 1
+        used_training_cfg.trainer.strategy = "auto"
+        used_training_cfg.trainer.sync_batchnorm = False
+
+        used_training_cfg.data.module.fold = int(fold_id)
+
         model = instantiate(used_training_cfg.model)
+        state = torch.load(ckp_path, map_location="cpu")
+        model.load_state_dict(state["state_dict"])
         state = torch.load(ckp_path, map_location="cpu")
         model.load_state_dict(state["state_dict"])
         model.eval()
@@ -124,11 +304,41 @@ def inference(cfg):
         dataset = instantiate(used_training_cfg.data).module
         dataset.setup("test")
 
+        dataset.setup("test")
+
         trainer = instantiate(used_training_cfg.trainer)
 
         predictions = trainer.predict(
             model, dataloaders=dataset.test_dataloader()
         )
+
+        predictions = trainer.predict(
+            model, dataloaders=dataset.test_dataloader()
+        )
+
+        ys, y_hats = zip(*predictions)
+        targets = torch.cat([y.detach().cpu() for y in ys]).float()
+        probas = torch.cat([p.detach().cpu() for (_, p) in y_hats], dim=0)
+        preds = (probas > 0.5).sum(dim=1).float()
+
+        # Sanity: verify all folds see the same test set in the same order.
+        # If they don't, ensemble averaging across folds would silently misalign.
+        patient_ids = list(dataset.test_dataset.img_files)
+        if targets_ref is None:
+            targets_ref = targets
+            patient_ids_ref = patient_ids
+        else:
+            if patient_ids != patient_ids_ref:
+                raise RuntimeError(
+                    f"[fold {fold_id}] Test patient IDs differ from fold "
+                    f"{fold_ids_sorted[0]}. Cannot ensemble: each fold sees a "
+                    f"different test set. Inspect splits.json."
+                )
+            if not torch.allclose(targets, targets_ref):
+                raise RuntimeError(
+                    f"[fold {fold_id}] Test targets differ from fold "
+                    f"{fold_ids_sorted[0]} (same IDs, different labels?)."
+                )
 
         ys, y_hats = zip(*predictions)
         targets = torch.cat([y.detach().cpu() for y in ys]).float()
@@ -179,8 +389,41 @@ def inference(cfg):
             }
         )
         out_path = os.path.join(cfg.exp_dir, f"predictions_fold{fold_id}.xlsx")
+            raise RuntimeError(
+                f"[fold {fold_id}] Length mismatch between patient IDs "
+                f"({len(patient_ids)}) and predictions ({len(preds)})."
+            )
+
+        # Per-fold metrics
+        metrics = _compute_metrics(preds, targets)
+        print(
+            f"[fold {fold_id}] N={metrics['N']}  MAE={metrics['MAE']:.4f}  "
+            f"RMSE={metrics['RMSE']:.4f}  ME={metrics['MeanError']:.4f}  "
+            f"Pearson={metrics['Pearson_r']:.4f}"
+        )
+
+        # Per-fold predictions xlsx
+        df = pd.DataFrame(
+            {
+                "PatientID": patient_ids,
+                "GroundTruth": targets.numpy(),
+                "Prediction": preds.numpy(),
+                "AbsError": (preds - targets).abs().numpy(),
+                "Error": (preds - targets).numpy(),
+            }
+        )
+        out_path = os.path.join(cfg.exp_dir, f"predictions_fold{fold_id}.xlsx")
         df.to_excel(out_path, index=False)
         print(f"[fold {fold_id}] Saved predictions to {out_path}")
+
+        # Per-fold age-bin error report + bar charts
+        _save_bin_report(
+            targets, preds,
+            tag=f"fold{fold_id}",
+            exp_dir=cfg.exp_dir,
+            bin_width=bin_width,
+            max_age=max_age,
+        )
 
         summary_rows.append({"Fold": fold_id, **metrics})
         all_probas.append(probas)
@@ -230,6 +473,22 @@ def inference(cfg):
         ens_a_row = {"Fold": "ENSEMBLE_avg_probas", **ens_metrics_a}
         ens_b_row = {"Fold": "ENSEMBLE_avg_preds", **ens_metrics_b}
         extra_rows = [mean_row, std_row, ens_a_row, ens_b_row]
+
+        # Age-bin reports for the two ensemble variants
+        _save_bin_report(
+            targets_ref, ens_preds_from_probas,
+            tag="ensemble_avg_probas",
+            exp_dir=cfg.exp_dir,
+            bin_width=bin_width,
+            max_age=max_age,
+        )
+        _save_bin_report(
+            targets_ref, ens_preds_from_preds,
+            tag="ensemble_avg_preds",
+            exp_dir=cfg.exp_dir,
+            bin_width=bin_width,
+            max_age=max_age,
+        )
     else:
         ens_preds_from_probas = None
         ens_preds_from_preds = None
