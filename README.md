@@ -22,10 +22,48 @@ Find a torch installation guide for your system [here](https://pytorch.org/get-s
 
 
 # Dataset preprocessing
+
 Currently, preprocessing is highly dataset- and user-dependent.
 However in [this file](/datasets/preprocess_3D_data/datasets/template_brain_preprocessing.py) you can find examples of how a dataset can be preprocessed.
 
-For the SSL3D challenge we will resample all images towards a 1mm target spacing and then crop the center of the image with an 160 cubic block.
+For the SSL3D challenge we will resample all images towards a 1mm target spacing and then crop the center of the image with a 160 cubic block.
+
+## CT preprocessing
+
+For CT datasets, use [`CT_preprocessing.py`](/datasets/preprocess_3D_data/datasets/CT_preprocessing.py). The script is dataset-agnostic and works on any CT dataset given a directory of `.nii.gz` images.
+
+The pipeline per case is:
+
+1. **Compute dataset-wide CT intensity statistics** in a first pass over all `.nii.gz` files in the input directory. Foreground voxels (HU > -500) are subsampled per case (10,000 voxels each) and aggregated to compute global mean, std, and the 0.5 / 99.5 percentiles. Stats are optionally cached to JSON via `--stats-cache` so subsequent runs skip this pass.
+2. **Resample to a target spacing** (default 1×1×1 mm isotropic). Cases that are already at the target spacing skip resampling.
+3. **Crop to the non-zero bounding box** (matches nnssl behavior — trims explicitly zero-padded edges while preserving all anatomical voxels, since CT air is at -1000 HU rather than 0).
+4. **CT normalization**: clip voxel values to the dataset-wide [percentile_00_5, percentile_99_5] range, then z-score using the dataset-wide mean and std. Unlike per-image z-score, this preserves the absolute meaning of HU values across cases.
+5. **Save as Blosc2** in the directory layout the dataloader expects:
+
+### Example usage
+
+```bash
+python datasets/preprocess_3D_data/datasets/CT_preprocessing.py \
+    --in-dir /path/to/raw/CT/images \
+    --out-root $nnssl_preprocessed/Dataset001_LiverROI/nnsslPlans_onemmiso \
+    --dataset-name Dataset001_LiverROI \
+    --target-spacing 1 1 1 \
+    --num-workers 8 \
+    --stats-cache $nnssl_preprocessed/Dataset001_LiverROI/ct_intensity_stats.json
+```
+
+### Arguments
+
+| Flag | Description |
+|---|---|
+| `--in-dir` | Directory of raw `.nii.gz` CT images. |
+| `--out-root` | Output root, e.g. `.../nnsslPlans_onemmiso`. The script writes to `<out-root>/<dataset-name>/<dataset-name>/<id>/ses-DEFAULT/<id>.b2nd`. |
+| `--dataset-name` | Name of the dataset folder (e.g. `Dataset001_LiverROI`). |
+| `--target-spacing Z Y X` | Target voxel spacing in mm. Default `1 1 1`. |
+| `--skip-resample` | Skip the resampling step entirely (use native spacing). |
+| `--num-workers` | Parallel processes for both passes. Default `8`. |
+| `--stats-cache PATH` | JSON file to cache intensity statistics between runs. |
+| `--stats-mean / --stats-std / --stats-pct-00-5 / --stats-pct-99-5` | Optional pre-supplied stats, bypasses the first pass. |
 
 # Including other datasets
 
