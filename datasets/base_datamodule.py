@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader, RandomSampler
 class BaseDataModule(LightningDataModule):
     def __init__(
         self,
-        data_root_dir,
         name,
         batch_size,
         train_transforms,
@@ -19,12 +18,13 @@ class BaseDataModule(LightningDataModule):
         num_workers,
         prepare_data_per_node,
         fold,
+        data_root_dir=None,
         *args,
         **kwargs
     ):
         super(BaseDataModule, self).__init__()
 
-        self.data_path = Path(data_root_dir)  # / name
+        self.data_path = Path(data_root_dir) if data_root_dir is not None else None
         self.batch_size = batch_size
         self.train_transforms = train_transforms
         self.test_transforms = test_transforms
