@@ -1,7 +1,7 @@
 # 3D medical image classification, regression, and ordinal regression repository
 <sub>Copyright German Cancer Research Center (DKFZ) and contributors. Please make sure that your usage of this code is in compliance with its license.<sub>
 
-This repository is a fork of [constantinulrich/SSL3D_classification](https://github.com/constantinulrich/SSL3D_classification), extended to support **regression** and **ordinal regression** tasks in addition to the original classification setup. The upstream repository in turn builds on the [IMAGE CLASSIFICATION FRAMEWORK BY HELMHOLTZ IMAGING](https://github.com/MIC-DKFZ/image_classification) and supports fine-tuning checkpoints from [nnssl](https://github.com/MIC-DKFZ/nnssl).
+This repository extends and builds on [constantinulrich/SSL3D_classification](https://github.com/constantinulrich/SSL3D_classification), extended to support **regression** and **ordinal regression** tasks in addition to the original classification setup. The upstream repository in turn builds on the [IMAGE CLASSIFICATION FRAMEWORK BY HELMHOLTZ IMAGING](https://github.com/MIC-DKFZ/image_classification) and supports fine-tuning checkpoints from [nnssl](https://github.com/MIC-DKFZ/nnssl).
 
 The main additions over upstream:
 - A new `Regression` task with MSE loss.
@@ -11,11 +11,7 @@ The main additions over upstream:
 
 # Installation
 
-This project can be installed with either `pip` (in a virtualenv or conda env) or [`uv`](https://docs.astral.sh/uv/) — a faster Python package manager. Both result in the same set of installed packages.
-
-## Option 1: uv (recommended)
-
-[uv](https://docs.astral.sh/uv/) is significantly faster than pip and handles the Python interpreter for you.
+This project uses [`uv`](https://docs.astral.sh/uv/) for environment and package management.
 
 ```shell
 # Install uv (if not already)
@@ -32,24 +28,13 @@ uv pip install torch torchvision --torch-backend=auto
 uv pip install -r requirements.txt
 ```
 
-You can also pin a specific CUDA build explicitly if `--torch-backend=auto` doesn't pick what you want:
+You can pin a specific CUDA build explicitly if `--torch-backend=auto` doesn't pick what you want:
 
 ```shell
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
 To deactivate the env later, run `deactivate`. To resume work, `cd` into the repo and `source .venv/bin/activate` again.
-
-## Option 2: pip
-
-Install the requirements in a [virtual environment](https://conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html):
-
-```shell
-pip install -r requirements.txt
-```
-
-You might need to adapt the cuda versions for torch and torchvision.
-Find a torch installation guide for your system [here](https://pytorch.org/get-started/locally/).
 
 ## Verifying the install
 
@@ -59,36 +44,63 @@ python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.cuda.
 
 You should see your torch version, `cuda: True`, and a non-zero device count if you have a GPU available.
 
+# Data CSV format
+
+Splits, labels, and fold assignments are all driven by a single CSV file per dataset. The CSV must contain these columns:
+
+| Column       | Type   | Description                                                                 |
+|--------------|--------|-----------------------------------------------------------------------------|
+| `image_name` | string | Subject/image identifier. Must match the `.b2nd` filename stem on disk (no extension). |
+| `split`      | string | One of `train`, `val`, `test`.                                              |
+| `fold`       | int    | Fold index (`0`, `1`, `2`, ...). Used for cross-validation.                 |
+| `<label>`    | float  | Target value. Column name is configurable (default `label`); rounded to int internally for ordinal regression. |
+
+Example:
+
+```csv
+image_name,split,label,fold
+sub-001,train,42.3,0
+sub-002,val,67.8,0
+sub-003,test,55.1,0
+sub-004,train,29.5,1
+sub-005,val,71.0,1
+```
+
+Notes:
+- For ordinal regression, labels are rounded to the nearest integer (`int(round(x))`) and must fall in `[0, num_classes - 1]`.
+- Splits are **global** across folds — an image's `split` value applies regardless of which fold is being trained. If you need per-fold splits, you'll need to extend the CSV schema.
+- The label column name can be customized via the `label_column` field in the data config (e.g., `label_column: age`).
+- **For k-fold cross-validation**, include one row per `(image, fold)` combination, with the `split` column indicating that image's role in that particular fold. With `cv.k=5` in the config, training is launched 5 times, each time filtering the CSV to one fold.
 
 # Dataset preprocessing
 
-Currently, preprocessing is highly dataset- and user-dependent.
-However in [this file](/datasets/preprocess_3D_data/datasets/template_brain_preprocessing.py) you can find examples of how a dataset can be preprocessed.
+Two preprocessing scripts are provided, one per modality: [`CT_preprocessing.py`](/datasets/preprocess_3D_data/datasets/CT_preprocessing.py) for CT and [`MRI_preprocessing.py`](/datasets/preprocess_3D_data/datasets/MRI_preprocessing.py) for MRI. Both take a directory of `.nii.gz` images, resample to a target spacing (default 1mm isotropic), crop to the non-zero bounding box, normalize, and save as Blosc2 (`.b2nd`) — preserving the full resampled volume. Random 160³ patch extraction happens at training time via `batchgenerators`, not during preprocessing.
 
-For the SSL3D challenge we will resample all images towards a 1mm target spacing and then crop the center of the image with a 160 cubic block.
+See the per-modality sections below for the normalization details, which differ between CT and MRI.
 
 ## CT preprocessing
 
 For CT datasets, use [`CT_preprocessing.py`](/datasets/preprocess_3D_data/datasets/CT_preprocessing.py). The script is dataset-agnostic and works on any CT dataset given a directory of `.nii.gz` images.
 
-The pipeline per case is:
+The pipeline runs in two passes:
 
-1. **Compute dataset-wide CT intensity statistics** in a first pass over all `.nii.gz` files in the input directory. Foreground voxels (HU > -500) are subsampled per case (10,000 voxels each) and aggregated to compute global mean, std, and the 0.5 / 99.5 percentiles. Stats are optionally cached to JSON via `--stats-cache` so subsequent runs skip this pass.
-2. **Resample to a target spacing** (default 1×1×1 mm isotropic). Cases that are already at the target spacing skip resampling.
-3. **Crop to the non-zero bounding box** (matches nnssl behavior — trims explicitly zero-padded edges while preserving all anatomical voxels, since CT air is at -1000 HU rather than 0).
-4. **CT normalization**: clip voxel values to the dataset-wide [percentile_00_5, percentile_99_5] range, then z-score using the dataset-wide mean and std. Unlike per-image z-score, this preserves the absolute meaning of HU values across cases.
-5. **Save as Blosc2** in the directory layout the dataloader expects:
+**Pass 1 — Compute dataset-wide intensity statistics.** Scans all `.nii.gz` files once, sampling up to 10,000 foreground voxels per case (HU > -500). Aggregates global mean, std, and 0.5 / 99.5 percentiles. You can skip this pass by supplying stats directly via `--stats-mean`, `--stats-std`, `--stats-pct-00-5`, and `--stats-pct-99-5`.
+
+**Pass 2 — Per-case processing.**
+1. Resample to a target spacing (default 1×1×1 mm isotropic). Cases already at the target spacing skip this step automatically.
+2. Crop to the non-zero bounding box (trims zero-padded edges; CT air at -1000 HU is preserved).
+3. CT-normalize: clip to the dataset-wide `[percentile_00_5, percentile_99_5]` range, then z-score using the dataset-wide mean and std.
+4. Save as Blosc2 at `<out-root>/<dataset-name>/<image_id>.b2nd`.
 
 ### Example usage
 
 ```bash
 python datasets/preprocess_3D_data/datasets/CT_preprocessing.py \
     --in-dir /path/to/raw/CT/images \
-    --out-root $nnssl_preprocessed/Dataset001_LiverROI/nnsslPlans_onemmiso \
+    --out-root /path/to/nnssl_preprocessed \
     --dataset-name Dataset001_LiverROI \
     --target-spacing 1 1 1 \
-    --num-workers 8 \
-    --stats-cache $nnssl_preprocessed/Dataset001_LiverROI/ct_intensity_stats.json
+    --num-workers 8
 ```
 
 ### Arguments
@@ -96,88 +108,132 @@ python datasets/preprocess_3D_data/datasets/CT_preprocessing.py \
 | Flag | Description |
 |---|---|
 | `--in-dir` | Directory of raw `.nii.gz` CT images. |
-| `--out-root` | Output root, e.g. `.../nnsslPlans_onemmiso`. The script writes to `<out-root>/<dataset-name>/<dataset-name>/<id>/ses-DEFAULT/<id>.b2nd`. |
+| `--out-root` | Output root. The script writes to `<out-root>/<dataset-name>/<image_id>.b2nd`. |
 | `--dataset-name` | Name of the dataset folder (e.g. `Dataset001_LiverROI`). |
 | `--target-spacing Z Y X` | Target voxel spacing in mm. Default `1 1 1`. |
 | `--skip-resample` | Skip the resampling step entirely (use native spacing). |
 | `--num-workers` | Parallel processes for both passes. Default `8`. |
-| `--stats-cache PATH` | JSON file to cache intensity statistics between runs. |
-| `--stats-mean / --stats-std / --stats-pct-00-5 / --stats-pct-99-5` | Optional pre-supplied stats, bypasses the first pass. |
+| `--stats-mean / --stats-std / --stats-pct-00-5 / --stats-pct-99-5` | Optional pre-supplied stats; bypasses Pass 1. All four must be set together. |
+
+## MRI preprocessing
+
+For MRI datasets, use [`MRI_preprocessing.py`](/datasets/preprocess_3D_data/datasets/MRI_preprocessing.py). The structure mirrors `CT_preprocessing.py` but with two key differences:
+
+- **No dataset-wide stats pass.** MRI has no absolute intensity reference (unlike CT's HU scale), so intensities are not comparable across scanners or sequences. Each case is z-scored independently on its own foreground.
+- **Foreground = voxels > 0.** This assumes the input MRIs are skull-stripped or otherwise have a zero background. For data with non-zero air background, mask it out first.
+
+The per-case pipeline:
+1. Resample to a target spacing (default 1×1×1 mm isotropic).
+2. Crop to the non-zero bounding box (typically trims a sizeable margin on skull-stripped MRI).
+3. Per-case z-score normalization on the foreground mask.
+4. Save as Blosc2 at `<out-root>/<dataset-name>/<image_id>.b2nd`.
+
+### Example usage
+
+```bash
+python datasets/preprocess_3D_data/datasets/MRI_preprocessing.py \
+    --in-dir /path/to/raw/MRI/images \
+    --out-root /path/to/nnssl_preprocessed \
+    --dataset-name Dataset017_OpenNeuro \
+    --target-spacing 1 1 1 \
+    --num-workers 8
+```
+
+### Arguments
+
+| Flag | Description |
+|---|---|
+| `--in-dir` | Directory of raw `.nii.gz` MR images. |
+| `--out-root` | Output root. The script writes to `<out-root>/<dataset-name>/<image_id>.b2nd`. |
+| `--dataset-name` | Name of the dataset folder (e.g. `Dataset017_OpenNeuro`). |
+| `--target-spacing Z Y X` | Target voxel spacing in mm. Default `1 1 1`. |
+| `--skip-resample` | Skip the resampling step entirely. |
+| `--num-workers` | Parallel processes. Default `8`. |
 
 # Including other datasets
 
-For including your own dataset follow these steps:
-1. In the ```dataset``` directory create a new file that implements the [torch dataset](https://pytorch.org/tutorials/beginner/basics/data_tutorial.html#creating-a-custom-dataset-for-your-files) class for your data. See [example](/datasets/RECvsT_1mm_cropped_160.py).
-2. Additionally, create the [DataModule](https://lightning.ai/docs/pytorch/stable/data/datamodule.html) for your dataset by writing a class that inherits from `BaseDataModule`. Write the `init` and `setup` functions for your dataset. The dataloaders are already defined by the `BaseDataModule`. An example could look like this:
-    ```python
-    from .base_datamodule import BaseDataModule
+If your dataset can be described as "a directory of preprocessed `.b2nd` files plus a CSV of splits/labels/folds," you don't need to write any new Python — just reuse the existing `AgeReg_DataModule` and point it at your data via the config.
 
-    class CustomDataModule(BaseDataModule):
-      def __init__(self, **params):
-          super(CustomDataModule, self).__init__(**params)
+## The common case: reuse `AgeReg_DataModule`
 
-      def setup(self, stage: str):
-          self.train_dataset = YourCustomPytorchDataset(
-              data_path=self.data_path,
-              split="train",
-              transform=self.train_transforms,
-          )
-          self.val_dataset = YourCustomPytorchDataset(
-              data_path=self.data_path,
-              split="val",
-              transform=self.test_transforms,
-          )
-    ```
-   Note that the `__init__` function takes `**params` and passes them to the super init. By doing so the attributes `self.data_path`, `self.train_transforms` and `self.test_transforms` are already set automatically and can be used in the `setup` function. The `self.data_path` is a joined path consisting of the configs `data.module.data_root_dir` and `data.module.name`.
-   Custom transforms can be added in `./augmentation/policies/<your-data>.py`. They need to inherit from the `BaseTransform` class. See the existing transforms for examples!
-3. Add a `<your-data>.yaml` file to the data config group, defining some data-specific variables.
-    ```yaml
-    # @package _global_
-    data:
-      module:
-        _target_: datasets.RECvsT_1mm_cropped_160.RECvsT_1mm_cropped_160_DataModule
-        name: RECvsT_1mm_cropped_160
-        data_root_dir: ${data_dir}
-        batch_size: 1
-        train_transforms:
-        _target_: augmentation.policies.batchgenerators.get_training_transforms
-        patch_size: ${data.patch_size}
-        rotation_for_DA: 0.523599
-        mirror_axes: [0,1,2]
-        do_dummy_2d_data_aug: False
-        test_transforms: null
-      cv:
-        k:3
+1. **Preprocess your data** with `CT_preprocessing.py` or `MRI_preprocessing.py` to produce `<out-root>/<dataset-name>/<image_id>.b2nd` files.
 
-      num_classes: 2
-      patch_size: [160, 160, 160]
+2. **Build a CSV** with `image_name`, `split`, `fold`, and a label column. See the [Data CSV format](#data-csv-format) section for the schema.
 
-    model:
-      task: 'Classification'
-      cifar_size: False
-      input_channels: 2
-      input_dim: 3
-      input_shape: ${data.patch_size}
-      optimizer: AdamW
-      lr: 0.0001
-      warmstart: 20
-      weight_decay: 1e-2
-      label_smoothing: 0.2
+3. **Add a `<your-data>.yaml`** to `cli_configs/data/`. The data config takes explicit paths to the image directory and CSV:
 
-    trainer:
-      logger:
-        project: RECvsT_1mm_cropped_160
-      accumulate_grad_batches: 48
-      max_epochs: 400
-      sync_batchnorm: True
+```yaml
+# @package _global_
+data:
+  module:
+    _target_: datasets.AgeReg.AgeReg_DataModule
+    name: YourDatasetName
+    img_dir: /path/to/preprocessed/<dataset-name>
+    csv_file: /path/to/splits_labels.csv
+    label_column: label   # or "age", etc.
+    batch_size: 4
+    train_transforms:
+      _target_: augmentation.policies.batchgenerators.get_training_transforms
+      patch_size: ${data.patch_size}
+      rotation_for_DA: 0.523599
+      mirror_axes: [0,1,2]
+      do_dummy_2d_data_aug: False
+    test_transforms:
+      _target_: augmentation.policies.batchgenerators.get_test_transforms
+      patch_size: ${data.patch_size}
+      do_dummy_2d_data_aug: False
+  cv:
+    k: 1
+  num_classes: 100
+  patch_size: [160, 160, 160]
 
-    metrics:
-      - 'f1'
-      - 'balanced_acc'
-      - 'ap'
-      - 'auroc'
-    ```
-   The `data.module._target_` defines the path to your `DataModule`. Note that the first line of the file needs to be `# @package _global_` in order for Hydra to read the config properly.
+model:
+  task: 'Ordinal_Regression'
+  input_channels: 1
+  input_dim: 3
+  input_shape: ${data.patch_size}
+  optimizer: AdamW
+  lr: 0.001
+  weight_decay: 1e-2
+
+trainer:
+  logger:
+    project: YourDatasetName
+  accumulate_grad_batches: 48
+  max_epochs: 200
+  sync_batchnorm: True
+
+metrics:
+  - 'mae'
+  - 'mse'
+```
+
+The first line **must** be `# @package _global_` for Hydra to merge the config correctly.
+
+4. **Run training** as usual:
+
+```bash
+python main.py env=cluster model=resenc_ord_reg data=your_data trainer.devices=1
+```
+
+You can also override paths from the command line for quick experiments:
+
+```bash
+python main.py data=your_data \
+    data.module.img_dir=/some/other/path \
+    data.module.csv_file=/path/to/other.csv
+```
+
+## When you actually need a custom `DataModule`
+
+Write a new `DataModule` only if your data doesn't fit the AgeReg pattern — for example:
+
+- **Multiple images per case** (e.g., paired modalities, multi-channel inputs).
+- **Per-fold splits** where the same image is `train` in one fold and `val` in another.
+- **Non-standard label structure** (e.g., multi-label classification, segmentation targets, censored survival times).
+- **A different file format** than `.b2nd`.
+
+In that case, mirror [`AgeReg.py`](/datasets/AgeReg.py) as a starting point: subclass `BaseDataModule`, accept your paths via `__init__`, and instantiate your `Dataset` in `setup()`. Custom transforms can go in `augmentation/policies/<your-data>.py`, inheriting from `BaseTransform`.
 
 # Tasks and losses
 
@@ -192,7 +248,7 @@ The model config takes two related fields:
 | `Regression`        | `MSELoss`                        | *(none)*                                                                                                       |
 | `Ordinal_Regression`| `coral_loss`                     | `focal`, `topk10`, `topk20`, `bce_focal`, `bce_topk10`, `bce_topk20`, `weighted_bce`, `bce_mae`                |
 
-Example regression-task config block:
+Example ordinal regression-task config block:
 
 ```yaml
 model:

@@ -2,8 +2,9 @@
 data:
   module:
     _target_: datasets.AgeReg.AgeReg_DataModule
-    name: OpenNeuroAgeRegression
-    data_root_dir: /home/jma/Documents/projects/aaron/nnssl_dataset/nnssl_preprocessed/Dataset017_OpenNeuro # To be changed for each dataset
+    name: AgeOrdinalRegression
+    img_dir: <path_to_preprocessed_images>
+    csv_file: <path_to_csv_file>
     batch_size: 4
     train_transforms:
       _target_: augmentation.policies.batchgenerators.get_training_transforms
@@ -38,8 +39,8 @@ model:
 
 trainer:
   logger:
-    project: nnSSL OpenNeuro Age Regression
-    name: QuickTest
+    project: <wandb_project_name>
+    name: <wandb_run_name>
   accumulate_grad_batches: 48
   max_epochs: 200
   sync_batchnorm: True

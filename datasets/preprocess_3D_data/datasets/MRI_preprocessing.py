@@ -1,17 +1,23 @@
 """
-General-purpose CT preprocessing for SSL3D_regression.
+General-purpose MRI preprocessing for SSL3D_regression.
 
-Reads raw NIfTI CT images, computes dataset-wide intensity statistics on the
-foreground (HU > -500), then for each case:
+Reads raw NIfTI MR images, then for each case:
   1. Resamples to a target spacing (default 1mm isotropic).
   2. Crops to the non-zero bounding box (matches nnssl behavior).
-  3. Applies CT normalization (clip to dataset percentiles + dataset z-score).
+  3. Applies per-case z-score normalization on the foreground (voxels > 0).
   4. Saves as Blosc2 in the directory layout the AgeReg dataloader expects:
         <out_root>/<dataset-name>/<id>.b2nd
 
 Notes:
   - This script is dataset-agnostic. Use --dataset-name to set the folder.
-  - Resampling order is 3 (cubic) for CT data, matching the SSL3D template.
+  - Unlike CT, MRI has no absolute intensity reference (HU). Intensities vary
+    by scanner, sequence, and acquisition, so dataset-wide stats are not
+    meaningful. Each case is z-scored independently on its own foreground.
+  - Foreground is defined as voxels > 0. This assumes the input MRIs have
+    been brain-extracted/skull-stripped or otherwise have a zero background.
+    If your data has a non-zero air background, mask it out first or modify
+    the normalizer.
+  - Resampling order is 3 (cubic) for image data, matching the SSL3D template.
   - If your data is already at the target spacing, resampling is a near-no-op
     (one short shape check) and adds negligible time. Pass --skip-resample to
     skip it explicitly.
@@ -19,19 +25,19 @@ Notes:
     batchgenerators, not here. We preserve full resampled volumes.
 
 Usage:
-    python CT_preprocessing.py \\
+    python MRI_preprocessing.py \\
         --in-dir <path_to_input_directory> \\
         --out-root <path_to_output_root> \\
         --dataset-name <dataset_name> \\
         --target-spacing 1 1 1 \\
-        --num-workers 8 
+        --num-workers 8
 """
 import sys
 import os
 import argparse
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 # Make the parent package importable when running this script directly,
 # matching the pattern used by template_brain_preprocessing.py.
@@ -44,91 +50,16 @@ import SimpleITK as sitk
 from tqdm import tqdm
 
 from datasets.preprocess_3D_data.cropping import crop_to_nonzero
-from datasets.preprocess_3D_data.normalization import CTNormalization
+from datasets.preprocess_3D_data.normalization import ZScoreNormalization
 from datasets.preprocess_3D_data.blosc_helper import save_case, comp_blosc2_params
 from datasets.preprocess_3D_data.default_resampling import resample_data_or_seg_to_spacing
 
-# CT-specific: voxels above this HU threshold count as foreground (tissue).
-# Air -1000, lung parenchyma -800, fat -100, water 0, soft tissue +30 to +60,
-# bone +400 and up. -500 cleanly separates air/lung from everything else.
-CT_FOREGROUND_HU_THRESHOLD = -500.0
-
-# How many foreground voxels to sample per case when computing dataset stats.
-# 10000 matches nnU-Net's default. Subsampling keeps memory bounded; the
-# percentiles and mean/std are accurate to within rounding error.
-NUM_FOREGROUND_SAMPLES_PER_CASE = 10_000
-
-# Cubic interpolation for CT image data. Matches SSL3D template default.
+# Cubic interpolation for MR image data. Matches SSL3D template default.
 RESAMPLING_ORDER = 3
 
 
 # --------------------------------------------------------------------------- #
-# Stats computation (Pass 1)
-# --------------------------------------------------------------------------- #
-def _sample_foreground_one_case(image_path: str) -> np.ndarray:
-    """
-    Load one NIfTI and return up to NUM_FOREGROUND_SAMPLES_PER_CASE
-    foreground (HU > -500) voxel samples.
-
-    Stats are computed on the *raw* (pre-resample) volume. This is correct
-    because resampling preserves intensity distribution, and computing on raw
-    data avoids double-paying the resample cost.
-    """
-    img = sitk.ReadImage(image_path)
-    data = sitk.GetArrayFromImage(img)  # (Z, Y, X), HU values
-    foreground = data[data > CT_FOREGROUND_HU_THRESHOLD]
-    if foreground.size == 0:
-        # Degenerate case (volume is mostly air?) - fall back to non-zero
-        foreground = data[data != 0]
-    if foreground.size == 0:
-        return np.empty((0,), dtype=np.float32)
-
-    if foreground.size > NUM_FOREGROUND_SAMPLES_PER_CASE:
-        # Deterministic per-file seed so the stats are reproducible
-        rng = np.random.default_rng(seed=hash(image_path) & 0xFFFFFFFF)
-        idx = rng.choice(foreground.size, size=NUM_FOREGROUND_SAMPLES_PER_CASE, replace=False)
-        foreground = foreground[idx]
-    return foreground.astype(np.float32)
-
-
-def compute_dataset_stats(
-    image_paths: List[str],
-    num_workers: int = 8,
-) -> dict:
-    """
-    Compute dataset-wide foreground intensity statistics for CT normalization.
-    Returns a dict with keys: mean, std, median, min, max, percentile_00_5,
-    percentile_99_5.
-    """
-    print(f"Computing CT intensity stats from {len(image_paths)} images...")
-    if num_workers > 1:
-        with Pool(processes=num_workers) as pool:
-            samples_per_case = list(
-                tqdm(pool.imap_unordered(_sample_foreground_one_case, image_paths),
-                     total=len(image_paths))
-            )
-    else:
-        samples_per_case = [_sample_foreground_one_case(p) for p in tqdm(image_paths)]
-
-    samples_per_case = [s for s in samples_per_case if s.size > 0]
-    if not samples_per_case:
-        raise RuntimeError("Could not extract any foreground voxels from any case.")
-
-    all_samples = np.concatenate(samples_per_case)
-    stats = {
-        "mean": float(np.mean(all_samples)),
-        "std": float(np.std(all_samples)),
-        "median": float(np.median(all_samples)),
-        "min": float(np.min(all_samples)),
-        "max": float(np.max(all_samples)),
-        "percentile_00_5": float(np.percentile(all_samples, 0.5)),
-        "percentile_99_5": float(np.percentile(all_samples, 99.5)),
-    }
-    return stats
-
-
-# --------------------------------------------------------------------------- #
-# Per-case processing (Pass 2)
+# Per-case processing
 # --------------------------------------------------------------------------- #
 def process_one_case(args: tuple) -> Optional[str]:
     """
@@ -139,10 +70,10 @@ def process_one_case(args: tuple) -> Optional[str]:
         1. Load
         2. Resample to target spacing (changes voxel grid, preserves anatomy)
         3. Crop to nonzero (safe to do after resampling - bbox tracks anatomy)
-        4. Normalize using dataset stats
+        4. Per-case z-score on the foreground mask (voxels > 0)
         5. Save
     """
-    image_path, out_path_truncated, intensity_properties, target_spacing, skip_resample = args
+    image_path, out_path_truncated, target_spacing, skip_resample = args
     case_id = Path(out_path_truncated).name
 
     try:
@@ -178,14 +109,19 @@ def process_one_case(args: tuple) -> Optional[str]:
                 )
 
         # ---- 3. Crop to non-zero bounding box ----
-        # For CT this typically only trims explicitly zero-padded edges. Real
-        # tissue has nonzero HU values so it survives the crop.
+        # For skull-stripped MRI this often trims a sizeable margin.
         data, _seg, _bbox = crop_to_nonzero(data, seg=None)
 
-        # ---- 4. CT-normalize using dataset-wide stats ----
-        normalizer = CTNormalization()
-        normalizer.intensityproperties = intensity_properties
-        data = normalizer.run(data)
+        # ---- 4. Per-case z-score on foreground (voxels > 0) ----
+        foreground_mask = data[0] > 0
+        if not foreground_mask.any():
+            print(f"[skip] {case_id}: empty foreground after cropping")
+            return None
+
+        normalizer = ZScoreNormalization()
+        # Pass the foreground mask as a seg-shaped tensor so the normalizer
+        # restricts mean/std to true tissue voxels.
+        data = normalizer.run(data, seg=foreground_mask[np.newaxis, ...])
 
         # ---- 5. Save as Blosc2 ----
         # save_case typically appends ".b2nd" itself; we pass the path without
@@ -211,12 +147,12 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--in-dir", required=True, type=Path,
-                        help="Directory containing raw .nii.gz CT images.")
+                        help="Directory containing raw .nii.gz MR images.")
     parser.add_argument("--out-root", required=True, type=Path,
-                        help="Output root, e.g. .../nnsslPlans_onemmiso. "
-                             "The script will write to <out-root>/<dataset-name>/<id>.b2nd")
+                        help="Output root. The script will write to "
+                             "<out-root>/<dataset-name>/<id>.b2nd")
     parser.add_argument("--dataset-name", required=True, type=str,
-                        help="Name of the dataset folder, e.g. Dataset001_LiverROI.")
+                        help="Name of the dataset folder, e.g. Dataset017_OpenNeuro.")
     parser.add_argument("--target-spacing", type=float, nargs=3,
                         default=[1.0, 1.0, 1.0], metavar=("Z", "Y", "X"),
                         help="Target spacing in mm as three floats: Z Y X. Default: 1 1 1.")
@@ -224,12 +160,6 @@ def main() -> None:
                         help="Skip resampling entirely (use the data as-is).")
     parser.add_argument("--num-workers", type=int, default=8,
                         help="Number of parallel processes. Default: 8")
-
-    # Optional pre-supplied stats (skip the dataset scan)
-    parser.add_argument("--stats-mean", type=float, default=None)
-    parser.add_argument("--stats-std", type=float, default=None)
-    parser.add_argument("--stats-pct-00-5", type=float, default=None)
-    parser.add_argument("--stats-pct-99-5", type=float, default=None)
 
     args = parser.parse_args()
 
@@ -240,30 +170,11 @@ def main() -> None:
     if not image_paths:
         raise SystemExit(f"No .nii.gz files found in {args.in_dir}")
 
-    print(f"Found {len(image_paths)} CT images.")
+    print(f"Found {len(image_paths)} MR images.")
     if args.skip_resample:
         print("[note] --skip-resample set. Volumes will be saved at their native spacing.")
     else:
         print(f"[note] target spacing (Z Y X): {tuple(args.target_spacing)} mm")
-
-    # ---- Resolve intensity stats ---- #
-    have_args_stats = all(
-        v is not None for v in [args.stats_mean, args.stats_std, args.stats_pct_00_5, args.stats_pct_99_5]
-    )
-
-    if have_args_stats:
-        intensity_properties = {
-            "mean": args.stats_mean,
-            "std": args.stats_std,
-            "percentile_00_5": args.stats_pct_00_5,
-            "percentile_99_5": args.stats_pct_99_5,
-        }
-        print(f"Using user-supplied stats: {intensity_properties}")
-    else:
-        intensity_properties = compute_dataset_stats(image_paths, num_workers=args.num_workers)
-        print("Computed stats:")
-        for k, v in intensity_properties.items():
-            print(f"  {k:>20s}: {v:.4f}")
 
     # ---- Build per-case output paths and dispatch ---- #
     out_root = args.out_root / args.dataset_name
@@ -281,7 +192,6 @@ def main() -> None:
         job_args.append((
             img_path,
             out_path_truncated,
-            intensity_properties,
             tuple(args.target_spacing),
             args.skip_resample,
         ))
