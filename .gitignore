@@ -1,5 +1,5 @@
 # dataset and mlflow
-data/
+/data/
 experiments/
 cluster_jobs.txt
 # Byte-compiled / optimized / DLL files

@@ -3,8 +3,18 @@ Reference:
 https://github.com/mzhaoshuai/Divide-and-Co-training/blob/main/model/mixup.py
 """
 
+from typing import Any
+
 import numpy as np
 import torch
+
+
+class BaseTransform(object):
+    def __init__(self):
+        pass
+
+    def __call__(self) -> Any:
+        pass
 
 
 @torch.no_grad()
