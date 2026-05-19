@@ -12,9 +12,9 @@ from torch._dynamo import OptimizedModule
 import torch.distributed as dist
 from einops import rearrange
 from peft import get_peft_model, LoraConfig, TaskType
-from base_model import BaseModel
-from models.classification_head import ClassificationHead
-from models.ordinal_regression_head import OrdinalRegressionHead
+from medregression3d.training.trainer import BaseModel
+from medregression3d.models.heads.classification import ClassificationHead
+from medregression3d.models.heads.ordinal_regression import OrdinalRegressionHead
 from batchgenerators.utilities.file_and_folder_operations import join, load_json, isfile
 
 

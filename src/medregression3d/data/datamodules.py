@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .base_datamodule import BaseDataModule
-from .blosc2io import Blosc2IO
+from medregression3d.utils.io import Blosc2IO
 
 
 class AgeReg_Data(Dataset):

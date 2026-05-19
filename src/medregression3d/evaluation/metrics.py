@@ -3,9 +3,64 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.figure import Figure
-from torchmetrics import Metric
+from torchmetrics import (
+    AUROC,
+    Accuracy,
+    AveragePrecision,
+    F1Score,
+    MeanAbsoluteError,
+    MeanSquaredError,
+    Precision,
+    Recall,
+    Metric,
+)
 from torchmetrics.functional.classification import stat_scores
 from torchmetrics.utilities.data import _bincount
+
+
+def _flatten_per_class_f1(metrics_res, prefix):
+    """Replace `<prefix>F1_per_class` tensor entry with one scalar per class."""
+    key = f"{prefix}F1_per_class"
+    if key in metrics_res:
+        for i, value in enumerate(metrics_res[key]):
+            metrics_res[f"{prefix}F1_class_{i}"] = (
+                value if not torch.isnan(value) else 0.0
+            )
+        del metrics_res[key]
+    return metrics_res
+
+
+def _build_classification_metrics(metrics_list, metric_task, num_classes):
+    """Build the dict of torchmetrics for classification tasks."""
+    common = dict(task=metric_task, num_classes=num_classes, num_labels=num_classes)
+    out = {}
+    if "acc" in metrics_list:
+        out["Accuracy"] = Accuracy(**common)
+    if "balanced_acc" in metrics_list:
+        out["Balanced_Accuracy"] = BalancedAccuracy(task=metric_task, num_classes=num_classes)
+    if "f1" in metrics_list:
+        out["F1"] = F1Score(average="macro", **common)
+    if "f1_per_class" in metrics_list:
+        out["F1_per_class"] = F1Score(average=None, **common)
+    if "pr" in metrics_list:
+        out["Precision"] = Precision(average="macro", **common)
+        out["Recall"] = Recall(average="macro", **common)
+    if "top5acc" in metrics_list:
+        out["Accuracy_top5"] = Accuracy(top_k=5, **common)
+    if "auroc" in metrics_list:
+        out["AUROC"] = AUROC(average="macro", **common)
+    if "ap" in metrics_list:
+        out["AP"] = AveragePrecision(**common)
+    return out
+
+
+def _build_regression_metrics(metrics_list):
+    out = {}
+    if "mse" in metrics_list:
+        out["MSE"] = MeanSquaredError()
+    if "mae" in metrics_list:
+        out["MAE"] = MeanAbsoluteError()
+    return out
 
 
 class BalancedAccuracy(Metric):

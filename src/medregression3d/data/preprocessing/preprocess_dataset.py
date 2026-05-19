@@ -2,8 +2,8 @@ import os
 import numpy as np
 import pandas as pd
 import json
-from datasets.preprocess_3D_data.utils_preprocessing import get_median_spacing_and_size_distributed, run_all_cases
-from datasets.preprocess_3D_data.cross_validation import generate_crossval_split
+from medregression3d.data.preprocessing.utils_preprocessing import get_median_spacing_and_size_distributed, run_all_cases
+from medregression3d.data.preprocessing.cross_validation import generate_crossval_split
 
 def preprocess_dataset_toshape(
         nii_files: list,

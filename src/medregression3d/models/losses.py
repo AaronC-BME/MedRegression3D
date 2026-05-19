@@ -1,6 +1,81 @@
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+VALID_TASKS = ("Classification", "Regression", "Ordinal_Regression")
+
+_VALID_LOSS_FNS = {
+    "Classification": (None, "focal", "topk10"),
+    "Regression": (None,),
+    "Ordinal_Regression": (
+        None, "focal", "topk10", "topk20",
+        "bce_focal", "bce_topk10", "bce_topk20",
+        "weighted_bce", "bce_mae",
+    ),
+}
+
+
+def _build_criterion(task, loss_fn, label_smoothing, subtask):
+    """Return the loss callable for a given (task, loss_fn) pair."""
+    if task not in VALID_TASKS:
+        raise ValueError(f"Unknown task: {task!r}. Expected one of {VALID_TASKS}.")
+
+    valid = _VALID_LOSS_FNS[task]
+    if loss_fn not in valid:
+        raise ValueError(
+            f"Unknown loss_fn={loss_fn!r} for task={task!r}. "
+            f"Valid options are: {valid}."
+        )
+
+    if task == "Classification":
+        if loss_fn is None:
+            if subtask == "multiclass":
+                return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+            if subtask == "multilabel":
+                return nn.BCEWithLogitsLoss()
+            raise ValueError(f"Unknown subtask: {subtask!r}")
+        if loss_fn == "focal":
+            print("Using Focal loss for Classification")
+            return FocalLoss()
+        if loss_fn == "topk10":
+            print("Using Topk10 loss for Classification")
+            return TopKLoss()
+
+    if task == "Regression":
+        return nn.MSELoss()
+
+    if task == "Ordinal_Regression":
+        if loss_fn is None:
+            return coral_loss
+        if loss_fn == "focal":
+            print("Using Coral Focal Loss (Gamma=3.0) for Ordinal Regression")
+            return partial(coral_focal_loss, gamma=3.0)
+        if loss_fn == "topk10":
+            print("Using Coral TopK10 Loss for Ordinal Regression")
+            return coral_topk_loss
+        if loss_fn == "topk20":
+            print("Using Coral TopK20 Loss for Ordinal Regression")
+            return partial(coral_topk_loss, k=20)
+        if loss_fn == "bce_focal":
+            print("Using Combined BCE and Focal Loss (Gamma=3.0) for Ordinal Regression")
+            return partial(combined_bce_focal_loss, gamma=3.0)
+        if loss_fn == "bce_topk10":
+            print("Using Combined BCE and TopK10 Loss for Ordinal Regression")
+            return combined_bce_topk_loss
+        if loss_fn == "bce_topk20":
+            print("Using Combined BCE and TopK20 Loss for Ordinal Regression")
+            return partial(combined_bce_topk_loss, topk=20)
+        if loss_fn == "weighted_bce":
+            print("Using Weighted BCE Loss for Ordinal Regression")
+            return coral_loss
+        if loss_fn == "bce_mae":
+            print("Using BCE Loss and MAE (L1) Loss for Ordinal Regression")
+            return combined_coral_mae_loss
+
+    raise ValueError(f"Unhandled (task, loss_fn) pair: ({task!r}, {loss_fn!r}).")
 
 
 class FocalLoss(nn.Module):

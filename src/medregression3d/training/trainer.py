@@ -1,179 +1,31 @@
-import math
-import warnings
-from functools import partial
-
-import lightning as L
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+import lightning as L
 from madgrad import MADGRAD
 from timm.optim import RMSpropTF
-from torch.optim.lr_scheduler import _LRScheduler
-from torchmetrics import (
-    AUROC,
-    Accuracy,
-    AveragePrecision,
-    F1Score,
-    MeanAbsoluteError,
-    MeanSquaredError,
-    MetricCollection,
-    Precision,
-    Recall,
-)
+from torchmetrics import MetricCollection
 from torchmetrics.aggregation import CatMetric
 
-from augmentation.mixup import mixup_criterion, mixup_data
-from losses.coral_loss import coral_loss, label_to_levels
-from metrics.balanced_accuracy import BalancedAccuracy
-from metrics.conf_mat import ConfusionMatrix
-from regularization.sam import SAM
+from medregression3d.data.transforms import mixup_criterion, mixup_data
+from medregression3d.evaluation.metrics import (
+    ConfusionMatrix,
+    _build_classification_metrics,
+    _build_regression_metrics,
+    _flatten_per_class_f1,
+)
+from medregression3d.models.losses import (
+    VALID_TASKS,
+    _build_criterion,
+    coral_loss,
+    label_to_levels,
+)
+from medregression3d.training.optim import (
+    CosineAnnealingLR_DoubleWarmstart,
+    CosineAnnealingLR_Warmstart,
+)
+from medregression3d.training.sam import SAM
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _flatten_per_class_f1(metrics_res, prefix):
-    """Replace `<prefix>F1_per_class` tensor entry with one scalar per class."""
-    key = f"{prefix}F1_per_class"
-    if key in metrics_res:
-        for i, value in enumerate(metrics_res[key]):
-            metrics_res[f"{prefix}F1_class_{i}"] = (
-                value if not torch.isnan(value) else 0.0
-            )
-        del metrics_res[key]
-    return metrics_res
-
-
-def _build_classification_metrics(metrics_list, metric_task, num_classes):
-    """Build the dict of torchmetrics for classification tasks."""
-    common = dict(task=metric_task, num_classes=num_classes, num_labels=num_classes)
-    out = {}
-    if "acc" in metrics_list:
-        out["Accuracy"] = Accuracy(**common)
-    if "balanced_acc" in metrics_list:
-        out["Balanced_Accuracy"] = BalancedAccuracy(task=metric_task, num_classes=num_classes)
-    if "f1" in metrics_list:
-        out["F1"] = F1Score(average="macro", **common)
-    if "f1_per_class" in metrics_list:
-        out["F1_per_class"] = F1Score(average=None, **common)
-    if "pr" in metrics_list:
-        out["Precision"] = Precision(average="macro", **common)
-        out["Recall"] = Recall(average="macro", **common)
-    if "top5acc" in metrics_list:
-        out["Accuracy_top5"] = Accuracy(top_k=5, **common)
-    if "auroc" in metrics_list:
-        out["AUROC"] = AUROC(average="macro", **common)
-    if "ap" in metrics_list:
-        out["AP"] = AveragePrecision(**common)
-    return out
-
-
-def _build_regression_metrics(metrics_list):
-    out = {}
-    if "mse" in metrics_list:
-        out["MSE"] = MeanSquaredError()
-    if "mae" in metrics_list:
-        out["MAE"] = MeanAbsoluteError()
-    return out
-
-
-VALID_TASKS = ("Classification", "Regression", "Ordinal_Regression")
-
-# Loss-function names valid for each task. None => task default.
-_VALID_LOSS_FNS = {
-    "Classification": (None, "focal", "topk10"),
-    "Regression": (None,),
-    "Ordinal_Regression": (
-        None, "focal", "topk10", "topk20",
-        "bce_focal", "bce_topk10", "bce_topk20",
-        "weighted_bce", "bce_mae",
-    ),
-}
-
-
-def _build_criterion(task, loss_fn, label_smoothing, subtask):
-    """Return the loss callable for a given (task, loss_fn) pair.
-
-    If ``loss_fn`` is ``None`` the task-specific default is used.
-    """
-    if task not in VALID_TASKS:
-        raise ValueError(f"Unknown task: {task!r}. Expected one of {VALID_TASKS}.")
-
-    valid = _VALID_LOSS_FNS[task]
-    if loss_fn not in valid:
-        raise ValueError(
-            f"Unknown loss_fn={loss_fn!r} for task={task!r}. "
-            f"Valid options are: {valid}."
-        )
-
-    # ---------- Classification ----------
-    if task == "Classification":
-        if loss_fn is None:
-            if subtask == "multiclass":
-                return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-            if subtask == "multilabel":
-                return nn.BCEWithLogitsLoss()
-            raise ValueError(f"Unknown subtask: {subtask!r}")
-        if loss_fn == "focal":
-            from losses.cls_loss import FocalLoss
-            print("Using Focal loss for Classification")
-            return FocalLoss()
-        if loss_fn == "topk10":
-            from losses.cls_loss import TopKLoss
-            print("Using Topk10 loss for Classification")
-            return TopKLoss()
-
-    # ---------- Regression ----------
-    if task == "Regression":
-        # Only None is valid (checked above).
-        return nn.MSELoss()
-
-    # ---------- Ordinal Regression ----------
-    if task == "Ordinal_Regression":
-        if loss_fn is None:
-            return coral_loss
-        if loss_fn == "focal":
-            from losses.coral_loss import coral_focal_loss
-            print("Using Coral Focal Loss (Gamma=3.0) for Ordinal Regression")
-            return partial(coral_focal_loss, gamma=3.0)
-        if loss_fn == "topk10":
-            from losses.coral_loss import coral_topk_loss
-            print("Using Coral TopK10 Loss for Ordinal Regression")
-            return coral_topk_loss
-        if loss_fn == "topk20":
-            from losses.coral_loss import coral_topk_loss
-            print("Using Coral TopK20 Loss for Ordinal Regression")
-            return partial(coral_topk_loss, k=20)
-        if loss_fn == "bce_focal":
-            from losses.coral_loss import combined_bce_focal_loss
-            print("Using Combined BCE and Focal Loss (Gamma=3.0) for Ordinal Regression")
-            return partial(combined_bce_focal_loss, gamma=3.0)
-        if loss_fn == "bce_topk10":
-            from losses.coral_loss import combined_bce_topk_loss
-            print("Using Combined BCE and TopK10 Loss for Ordinal Regression")
-            return combined_bce_topk_loss
-        if loss_fn == "bce_topk20":
-            from losses.coral_loss import combined_bce_topk_loss
-            print("Using Combined BCE and TopK20 Loss for Ordinal Regression")
-            return partial(combined_bce_topk_loss, topk=20)
-        if loss_fn == "weighted_bce":
-            # Weights are populated in setup() and passed in training/val step.
-            print("Using Weighted BCE Loss for Ordinal Regression")
-            return coral_loss
-        if loss_fn == "bce_mae":
-            from losses.coral_loss import combined_coral_mae_loss
-            print("Using BCE Loss and MAE (L1) Loss for Ordinal Regression")
-            return combined_coral_mae_loss
-
-    # Unreachable: guarded by the validity check above.
-    raise ValueError(f"Unhandled (task, loss_fn) pair: ({task!r}, {loss_fn!r}).")
-
-
-# ---------------------------------------------------------------------------
-# Main module
-# ---------------------------------------------------------------------------
 
 class BaseModel(L.LightningModule):
     def __init__(
@@ -610,17 +462,17 @@ class BaseModel(L.LightningModule):
 
         print("Initializing weights")
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if isinstance(m, torch.nn.Conv2d):
+                torch.nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, nn.SyncBatchNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=1e-3)
+                    torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (torch.nn.BatchNorm2d, torch.nn.GroupNorm, torch.nn.SyncBatchNorm)):
+                torch.nn.init.constant_(m.weight, 1)
+                torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, torch.nn.Linear):
+                torch.nn.init.normal_(m.weight, std=1e-3)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    torch.nn.init.constant_(m.bias, 0)
 
     # -----------------------------------------------------------------------
     # Optimizer / scheduler
@@ -642,9 +494,7 @@ class BaseModel(L.LightningModule):
         return encoder_params, reg_head_params, "reg_head"
 
     def _build_param_groups(self):
-        """Param groups for optimizers. Returns either an iterable of params or
-        a list of param-group dicts (when sawtooth fine-tuning is on)."""
-        # Optionally split norm/bias params off from weight decay.
+        """Param groups: plain iterable, or list of dicts for sawtooth fine-tuning."""
         if self.undecay_norm:
             model_params, norm_params = [], []
             for name, p in self.named_parameters():
@@ -664,9 +514,6 @@ class BaseModel(L.LightningModule):
         if self.finetuning_method != "full_sawtooth":
             return base_params
 
-        # Sawtooth: separate head from encoder so the scheduler can warm them
-        # up independently. We always rebuild the groups directly from named
-        # params (the undecay_norm split is not combined with sawtooth).
         encoder_params, head_params, head_name = self._split_params_for_sawtooth()
 
         common_head = {
@@ -681,7 +528,6 @@ class BaseModel(L.LightningModule):
             "weight_decay": self.weight_decay,
             "name": "encoder",
         }
-        # Some optimizers want momentum in the group dict
         if self.optimizer in ("SGD", "Madgrad"):
             common_head["momentum"] = 0.9
             common_enc["momentum"] = 0.9
@@ -761,12 +607,10 @@ class BaseModel(L.LightningModule):
             )
 
         if self.scheduler == "Step":
-            # Decay every quarter of total epochs
             return torch.optim.lr_scheduler.StepLR(
                 optimizer, step_size=self.epochs // 4, gamma=0.1,
             )
         if self.scheduler == "MultiStep":
-            # Decay at half and three-quarters of training
             return torch.optim.lr_scheduler.MultiStepLR(
                 optimizer, [self.epochs // 2, self.epochs * 3 // 4],
             )
@@ -774,8 +618,6 @@ class BaseModel(L.LightningModule):
         raise ValueError(f"Unknown scheduler: {self.scheduler}")
 
     def configure_optimizers(self):
-        # Note from original: leave bias and BN params undecayed
-        # (https://arxiv.org/pdf/1812.01187.pdf, Bag of Tricks).
         params = self._build_param_groups()
 
         if self.sam:
@@ -788,158 +630,6 @@ class BaseModel(L.LightningModule):
             return [optimizer]
         return [optimizer], [scheduler]
 
-
-# ---------------------------------------------------------------------------
-# Schedulers
-# ---------------------------------------------------------------------------
-
-class CosineAnnealingLR_Warmstart(_LRScheduler):
-    """
-    CosineAnnealingLR with a linear warmup phase. See
-    https://arxiv.org/pdf/1706.02677.pdf.
-    """
-
-    def __init__(
-        self, optimizer, T_max, eta_min=0, last_epoch=-1, verbose=False, warmstart=0,
-    ):
-        self.T_max = T_max - warmstart  # warmup epochs not part of cosine period
-        self.eta_min = eta_min
-        self.warmstart = warmstart
-        self.T = 0
-        super().__init__(optimizer, last_epoch)
-
-    def get_lr(self):
-        if not self._get_lr_called_within_step:
-            warnings.warn(
-                "To get the last learning rate computed by the scheduler, "
-                "please use `get_last_lr()`.",
-                UserWarning,
-            )
-
-        # Warmup
-        if self.last_epoch < self.warmstart:
-            addrates = [lr / (self.warmstart + 1) for lr in self.base_lrs]
-            return [
-                addrates[i] * (self.last_epoch + 1)
-                for i, _ in enumerate(self.optimizer.param_groups)
-            ]
-
-        # Cosine annealing
-        if self.T == 0:
-            self.T += 1
-            return self.base_lrs
-
-        if (self.T - 1 - self.T_max) % (2 * self.T_max) == 0:
-            updated_lr = [
-                group["lr"]
-                + (base_lr - self.eta_min)
-                * (1 - math.cos(math.pi / self.T_max))
-                / 2
-                for base_lr, group in zip(self.base_lrs, self.optimizer.param_groups)
-            ]
-            self.T += 1
-            return updated_lr
-
-        updated_lr = [
-            (1 + math.cos(math.pi * self.T / self.T_max))
-            / (1 + math.cos(math.pi * (self.T - 1) / self.T_max))
-            * (group["lr"] - self.eta_min)
-            + self.eta_min
-            for group in self.optimizer.param_groups
-        ]
-        self.T += 1
-        return updated_lr
-
-
-class CosineAnnealingLR_DoubleWarmstart(_LRScheduler):
-    """
-    Two consecutive linear warmup phases followed by cosine annealing.
-
-    - Phase 1 (warmstart1 epochs): only the head warms up; encoder LR stays at 0.
-    - Phase 2 (warmstart2 epochs): both head and encoder warm up.
-    - Cosine annealing decays both groups.
-    """
-
-    def __init__(
-        self,
-        optimizer,
-        T_max,
-        eta_min=0,
-        last_epoch=-1,
-        verbose=False,
-        warmstart1=0,
-        warmstart2=0,
-    ):
-        self.warmstart1 = warmstart1
-        self.warmstart2 = warmstart2
-        self.eta_min = eta_min
-        self.T_max = T_max - (warmstart1 + warmstart2)  # cosine decay period
-        self.T = 0  # internal counter (unused, kept for parity)
-
-        # Locate parameter groups by name; either "cls_head" or "reg_head" works.
-        self.head_group = None
-        self.encoder_group = None
-        for param_group in optimizer.param_groups:
-            name = param_group.get("name")
-            if name in ("cls_head", "reg_head"):
-                self.head_group = param_group
-            elif name == "encoder":
-                self.encoder_group = param_group
-
-        if self.head_group is None:
-            raise ValueError(
-                "Optimizer must have a parameter group named 'cls_head' or 'reg_head'."
-            )
-        if self.encoder_group is None:
-            raise ValueError("Optimizer must have a parameter group named 'encoder'.")
-
-        super().__init__(optimizer, last_epoch)
-
-    def get_lr(self):
-        if not self._get_lr_called_within_step:
-            warnings.warn(
-                "To get the last learning rate computed by the scheduler, "
-                "please use `get_last_lr()`.",
-                UserWarning,
-            )
-
-        warmup_total = self.warmstart1 + self.warmstart2
-
-        # Phase 1: warm up the head only.
-        if self.last_epoch < self.warmstart1:
-            # Bug fix: guard against warmstart1 == 0 (would div-by-zero, though
-            # the branch wouldn't be taken with warmstart1 == 0 anyway).
-            denom = max(self.warmstart1, 1)
-            warmup_factor = (self.last_epoch + 1) / denom
-            return [
-                group["initial_lr"] * warmup_factor if group is self.head_group else 0
-                for group in self.optimizer.param_groups
-            ]
-
-        # Phase 2: warm up both head and encoder.
-        if self.last_epoch < warmup_total:
-            # Bug fix: guard against warmstart2 == 0.
-            denom = max(self.warmstart2, 1)
-            warmup_factor = (self.last_epoch - self.warmstart1 + 1) / denom
-            return [
-                group["initial_lr"] * warmup_factor
-                for group in self.optimizer.param_groups
-            ]
-
-        # Cosine annealing for both groups.
-        epoch_cosine = self.last_epoch - warmup_total
-        return [
-            self.eta_min
-            + (group["initial_lr"] - self.eta_min)
-            * 0.5
-            * (1 + math.cos(math.pi * epoch_cosine / self.T_max))
-            for group in self.optimizer.param_groups
-        ]
-
-
-# ---------------------------------------------------------------------------
-# Generic wrapper
-# ---------------------------------------------------------------------------
 
 class ModelConstructor(BaseModel):
     def __init__(self, model, **kwargs):

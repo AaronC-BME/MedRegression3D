@@ -1,6 +1,6 @@
 # @package _global_
 model:
-  _target_: models.resenc.ResEncoder_OrdinalRegressor_MLP
+  _target_: medregression3d.models.backbones.resenc.ResEncoder_OrdinalRegressor_MLP
   pretrained: True
   chpt_path: null
   classification_head_dropout: 0.2

@@ -4,9 +4,9 @@ import blosc2
 import os
 from multiprocessing import Pool
 import numpy as np
-from datasets.preprocess_3D_data.normalization import ZScoreNormalization
-from datasets.preprocess_3D_data.default_resampling import resample_data_or_seg_to_shape, resample_data_or_seg_to_spacing
-from datasets.preprocess_3D_data.blosc_helper import save_case, comp_blosc2_params
+from medregression3d.data.preprocessing.normalization import ZScoreNormalization
+from medregression3d.data.preprocessing.default_resampling import resample_data_or_seg_to_shape, resample_data_or_seg_to_spacing
+from medregression3d.data.preprocessing.blosc_helper import save_case, comp_blosc2_params
 
 
 def run_case_npy(data: np.ndarray, original_spacing: list, target_shape_or_spacing:list, mode:str):

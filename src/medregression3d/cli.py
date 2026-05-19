@@ -9,12 +9,7 @@ from hydra.utils import instantiate
 from lightning.pytorch import seed_everything
 from omegaconf import OmegaConf
 
-from parsing_utils import make_omegaconf_resolvers
-
-
-# Example invocations:
-#   python main.py env=local model=primus data=smartbrain trainer.devices=1 model.pretrained=False
-#   python main.py env=cluster model=resenc_ord_reg data=age_ord_reg trainer.devices=1 model.pretrained=False
+from medregression3d.utils.parsing import make_omegaconf_resolvers
 
 
 def _prepare_cfg(cfg):
@@ -24,8 +19,7 @@ def _prepare_cfg(cfg):
         cfg.trainer.benchmark = False
         cfg.trainer.deterministic = True
 
-    # main.log gets auto-created by Hydra; remove it so we don't keep two logs
-    # (W&B already captures everything).
+    # Hydra auto-creates main.log; remove it (W&B already captures everything).
     with suppress(FileNotFoundError):
         Path("./main.log").unlink()
 
@@ -35,12 +29,9 @@ def _prepare_cfg(cfg):
     uid = cfg.output_subdir.split("/")[-1]
     cfg.trainer.logger.group = uid
 
-    # Sync BN across GPUs when training on multiple devices
     if cfg.trainer.devices > 1 and cfg.trainer.accelerator == "gpu":
         cfg.trainer.sync_batchnorm = True
 
-    # Filter callbacks: drop any that are None/disabled, and drop ModelCheckpoint
-    # if checkpointing is off.
     cfg.trainer.callbacks = [c for c in cfg.trainer.callbacks.values() if c]
     if not cfg.trainer["enable_checkpointing"]:
         cfg.trainer.callbacks = [
@@ -70,24 +61,20 @@ def _log_hyperparams(trainer, cfg):
     """Strip non-loggable fields and forward the rest to the logger."""
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
 
-    # Model
     cfg_dict["model"].pop("_target_")
     cfg_dict["model"]["model"] = cfg_dict["model"].pop("name")
     trainer.logger.log_hyperparams(cfg_dict["model"])
 
-    # Data
     data_module = cfg_dict["data"]["module"]
     data_module.pop("_target_")
     for key in ("train_transforms", "test_transforms"):
         if data_module.get(key) is not None:
-            # Keep the last two parts of the dotted target path
             data_module[key] = ".".join(
                 data_module[key]["_target_"].split(".")[-2:]
             )
     data_module.pop("name")
     trainer.logger.log_hyperparams(data_module)
 
-    # Trainer
     trainer_cfg = cfg_dict["trainer"]
     for key in (
         "_target_", "callbacks", "enable_checkpointing",
@@ -97,14 +84,18 @@ def _log_hyperparams(trainer, cfg):
     trainer.logger.log_hyperparams(trainer_cfg)
 
 
-@hydra.main(version_base=None, config_path="./cli_configs", config_name="train")
+CONFIG_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "configs")
+)
+
+
+@hydra.main(version_base=None, config_path=CONFIG_DIR, config_name="train")
 def main(cfg):
     uid = _prepare_cfg(cfg)
     print(OmegaConf.to_yaml(cfg))
 
     base_run_name = cfg.trainer.logger.get("name", None)
 
-    # CV loop (default k=1 means no CV)
     for k in range(cfg.data.cv.k):
         if cfg.data.cv.k > 1:
             cfg.data.module.fold = k
@@ -118,10 +109,6 @@ def main(cfg):
 
         trainer = instantiate(cfg.trainer)
         model = instantiate(cfg.model)
-
-        # Useful when debugging which params are trainable:
-        # for name, p in model.named_parameters():
-        #     print(name, p.requires_grad)
 
         if cfg.model.compile:
             model = torch.compile(model, mode="default")

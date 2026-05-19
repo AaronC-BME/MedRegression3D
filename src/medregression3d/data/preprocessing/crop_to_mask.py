@@ -5,7 +5,7 @@ import SimpleITK as sitk
 from multiprocessing import Pool
 from functools import partial
 
-from datasets.preprocess_3D_data.blosc_helper import save_case, comp_blosc2_params
+from medregression3d.data.preprocessing.blosc_helper import save_case, comp_blosc2_params
 
 
 def load_image_np(path):

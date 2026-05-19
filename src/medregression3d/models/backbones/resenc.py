@@ -5,10 +5,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch._dynamo import OptimizedModule
 import torch.distributed as dist
 
-from base_model import BaseModel
-from models.classification_head import ClassificationHead
-from models.regression_head import RegressionHead
-from models.ordinal_regression_head import OrdinalRegressionHead, OrdinalRegressionHead_MLP
+from medregression3d.training.trainer import BaseModel
+from medregression3d.models.heads.classification import ClassificationHead
+from medregression3d.models.heads.regression import RegressionHead
+from medregression3d.models.heads.ordinal_regression import OrdinalRegressionHead, OrdinalRegressionHead_MLP
 
 
 def get_first_valid_key(d, keys):

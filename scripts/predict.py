@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from parsing_utils import make_omegaconf_resolvers
+from medregression3d.utils.parsing import make_omegaconf_resolvers
 
 
 def _select_best_ckpt(ckp_paths, prefer_best=True):

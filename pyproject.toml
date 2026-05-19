@@ -53,12 +53,15 @@ dev = [
     "jupyter>=1.0",
 ]
 
+[project.scripts]
+medreg-train = "medregression3d.cli:main"
+
 [project.urls]
 Repository = "https://github.com/AaronC-BME/MedRegression3D"
 
 [tool.setuptools.packages.find]
-where = ["."]
-exclude = ["tests*", "cli_configs*", "debug_inputs*"]
+where = ["src"]
+include = ["medregression3d*"]
 
 [tool.ruff]
 line-length = 100
