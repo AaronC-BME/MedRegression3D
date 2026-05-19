@@ -113,3 +113,4 @@ checkpoints/
 *.pth
 *.tar.gz
 lightning_logs/
+wandb_offline_plots/

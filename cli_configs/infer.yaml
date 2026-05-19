@@ -8,8 +8,8 @@ hydra:
 override hydra/hydra_logging: disable
 override hydra/job_logging: disable
 
-exp_dir: /home/jma/Documents/projects/aaron/nnssl_dataset/nnssl_results/Dataset017_OpenNeuro/Ord_reg_VoCo_pretrained_lr_1e-3_DblWrmUp/OpenNeuroAgeRegression/checkpoints # path to the directory containing the hydra configs and fold directories
-ckpt_dir: /home/jma/Documents/projects/aaron/nnssl_dataset/nnssl_results/Dataset017_OpenNeuro/Ord_reg_VoCo_pretrained_lr_1e-3_DblWrmUp/OpenNeuroAgeRegression/checkpoints/389e1efc-2d8e-47ac-8a95-3e46b3fb0fd6 # Parent directory of fold 0
+exp_dir: /home/jma/projects/aaron/Dataset/nnssl_dataset/nnssl_results/Dataset003_LiverAge/ResNetL-VOCO/liver/checkpoints # path to the directory containing the hydra configs and fold directories
+ckpt_dir: /home/jma/projects/aaron/Dataset/nnssl_dataset/nnssl_results/Dataset003_LiverAge/ResNetL-VOCO/liver/checkpoints/6c664b4d-9452-4fca-8ee5-a114f9114a27 # Parent directory of fold 0
 fold: 0  # if no fold is given, an ensemble of all available folds will be used (if only one fold is available this can be ignored)
 pred_dir: null
 
