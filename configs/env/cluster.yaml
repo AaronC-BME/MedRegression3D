@@ -1,11 +1,5 @@
 # @package _global_
-exp_dir: ${oc.env:EXPERIMENT_LOCATION}
+# Reads EXPERIMENT_LOCATION env var if set, otherwise falls back to the placeholder below.
+# To skip the env var, replace the default with a hard-coded path.
+output_dir: ${oc.env:EXPERIMENT_LOCATION,"<path_to_output>"}
 
-trainer:
-  enable_progress_bar: True
-  callbacks:
-    progressbar:
-      _target_: lightning.pytorch.callbacks.TQDMProgressBar
-    lr_monitor:
-      _target_: lightning.pytorch.callbacks.LearningRateMonitor
-      logging_interval: epoch

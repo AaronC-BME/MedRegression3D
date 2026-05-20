@@ -6,7 +6,6 @@ from torch._dynamo import OptimizedModule
 import torch.distributed as dist
 
 from medregression3d.training.trainer import BaseModel
-from medregression3d.models.heads.classification import ClassificationHead
 from medregression3d.models.heads.regression import RegressionHead
 from medregression3d.models.heads.ordinal_regression import OrdinalRegressionHead, OrdinalRegressionHead_MLP
 
@@ -74,29 +73,6 @@ class ResEncoder(Module):
         return x
 
 
-class ResEncoder_Classifier(BaseModel):
-    def __init__(
-        self,
-        **hypparams,
-    ):
-        super(ResEncoder_Classifier, self).__init__(**hypparams)
-
-        self.encoder = ResEncoder(**hypparams)
-
-        self.cls_head = ClassificationHead(
-            320,
-            hypparams["num_classes"],
-            dropout=hypparams["classification_head_dropout"],
-            patch_aggregation_method=hypparams["token_aggregation_method"],
-        )
-
-    def forward(self, x):
-        x = self.encoder(x)
-        x = self.cls_head(x)
-
-        return x
-
-
 class ResEncoder_Regressor(BaseModel):
     """ResEncoder backbone with a plain regression head.
 
@@ -113,7 +89,7 @@ class ResEncoder_Regressor(BaseModel):
         self.reg_head = RegressionHead(
             embed_dim=320,
             num_outputs=hypparams.get("num_outputs", 1),
-            dropout=hypparams.get("classification_head_dropout", 0.1),
+            dropout=hypparams.get("regression_head_dropout", 0.1),
             patch_aggregation_method=hypparams.get("token_aggregation_method", "avg"),
             cls_token_available=False,
         )
@@ -144,7 +120,7 @@ class ResEncoder_OrdinalRegressor(BaseModel):
         self.reg_head = OrdinalRegressionHead(
             embed_dim=320,
             num_classes=hypparams["num_classes"],
-            dropout=hypparams.get("classification_head_dropout", 0.1),
+            dropout=hypparams.get("regression_head_dropout", 0.1),
             patch_aggregation_method=hypparams.get("token_aggregation_method", "avg"),
             cls_token_available=False,
         )
@@ -175,7 +151,7 @@ class ResEncoder_OrdinalRegressor_MLP(BaseModel):
         self.reg_head = OrdinalRegressionHead_MLP(
             embed_dim=320,
             num_classes=hypparams["num_classes"],
-            dropout=hypparams.get("classification_head_dropout", 0.1),
+            dropout=hypparams.get("regression_head_dropout", 0.1),
             patch_aggregation_method=hypparams.get("token_aggregation_method", "avg"),
             cls_token_available=False,
         )

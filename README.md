@@ -1,13 +1,14 @@
-# 3D medical image classification, regression, and ordinal regression repository
+# 3D medical image regression and ordinal regression repository
 <sub>Copyright German Cancer Research Center (DKFZ) and contributors. Please make sure that your usage of this code is in compliance with its license.<sub>
 
-This repository extends and builds on [constantinulrich/SSL3D_classification](https://github.com/constantinulrich/SSL3D_classification), extended to support **regression** and **ordinal regression** tasks in addition to the original classification setup. The upstream repository in turn builds on the [IMAGE CLASSIFICATION FRAMEWORK BY HELMHOLTZ IMAGING](https://github.com/MIC-DKFZ/image_classification) and supports fine-tuning checkpoints from [nnssl](https://github.com/MIC-DKFZ/nnssl).
+This repository extends and builds on [constantinulrich/SSL3D_classification](https://github.com/constantinulrich/SSL3D_classification), refocused on **regression** and **ordinal regression** tasks. The upstream repository in turn builds on the [IMAGE CLASSIFICATION FRAMEWORK BY HELMHOLTZ IMAGING](https://github.com/MIC-DKFZ/image_classification) and supports fine-tuning checkpoints from [nnssl](https://github.com/MIC-DKFZ/nnssl).
 
-The main additions over upstream:
-- A new `Regression` task with MSE loss.
-- A new `Ordinal_Regression` task using the [CORAL](https://arxiv.org/abs/1901.07884) formulation, with several alternative ordinal losses (focal, top-k, weighted BCE, BCE+MAE, etc.) selectable via a `loss_fn` config field.
-- New model variants: `ResEncoder_Regressor` (plain regression head) and `ResEncoder_OrdinalRegressor` (CORAL-style head).
+The main differences from upstream:
+- A `Regression` task with MSE loss.
+- An `Ordinal_Regression` task using the [CORAL](https://arxiv.org/abs/1901.07884) formulation, with several alternative ordinal losses (focal, top-k, weighted BCE, BCE+MAE, etc.) selectable via a `loss_fn` config field.
+- Model variants: `ResEncoder_Regressor` (plain regression head), `ResEncoder_OrdinalRegressor` (CORAL-style head), and `ResEncoder_OrdinalRegressor_MLP` (CORAL head with an MLP projection).
 - Inference script `inference_ord_reg_last_ckpt.py` for ordinal regression checkpoints.
+- The original `Classification` task and its associated models/losses/metrics have been removed.
 
 # Installation
 
@@ -78,6 +79,25 @@ Two preprocessing scripts are provided, one per modality: [`CT_preprocessing.py`
 
 See the per-modality sections below for the normalization details, which differ between CT and MRI.
 
+## Suggested directory layout
+
+The data module doesn't enforce a layout — it just needs `img_dir` (a folder of preprocessed `.b2nd` files) and `csv_file` (the splits/labels CSV). That said, a tidy convention that keeps everything for one dataset under one folder:
+
+```
+dataset/
+└── <data_name>/
+    ├── raw/                <- original .nii.gz files (kept for re-preprocessing)
+    ├── preprocessed/       <- .b2nd output from CT_preprocessing.py / MRI_preprocessing.py
+    └── split_labels.csv    <- splits/labels/folds CSV
+```
+
+Then in the data config:
+
+```yaml
+img_dir: dataset/<data_name>/preprocessed
+csv_file: dataset/<data_name>/split_labels.csv
+```
+
 ## CT preprocessing
 
 For CT datasets, use [`CT_preprocessing.py`](/datasets/preprocess_3D_data/datasets/CT_preprocessing.py). The script is dataset-agnostic and works on any CT dataset given a directory of `.nii.gz` images.
@@ -97,7 +117,7 @@ The pipeline runs in two passes:
 ```bash
 python datasets/preprocess_3D_data/datasets/CT_preprocessing.py \
     --in-dir /path/to/raw/CT/images \
-    --out-root /path/to/nnssl_preprocessed \
+    --out-root /path/to/preprocessed_data \
     --dataset-name Dataset001_LiverROI \
     --target-spacing 1 1 1 \
     --num-workers 8
@@ -133,7 +153,7 @@ The per-case pipeline:
 ```bash
 python datasets/preprocess_3D_data/datasets/MRI_preprocessing.py \
     --in-dir /path/to/raw/MRI/images \
-    --out-root /path/to/nnssl_preprocessed \
+    --out-root /path/to/preprocessed_data \
     --dataset-name Dataset017_OpenNeuro \
     --target-spacing 1 1 1 \
     --num-workers 8
@@ -239,12 +259,11 @@ In that case, mirror [`AgeReg.py`](/datasets/AgeReg.py) as a starting point: sub
 
 The model config takes two related fields:
 
-- `task`: one of `'Classification'`, `'Regression'`, `'Ordinal_Regression'`.
+- `task`: one of `'Regression'`, `'Ordinal_Regression'`.
 - `loss_fn`: name of the loss to use. When `null`, a sensible default is selected per task (see table below).
 
 | `task`              | `loss_fn: null` (default)       | Other valid `loss_fn` values                                                                                  |
 |---------------------|----------------------------------|----------------------------------------------------------------------------------------------------------------|
-| `Classification`    | `CrossEntropyLoss` (multiclass) / `BCEWithLogitsLoss` (multilabel) | `focal`, `topk10`                                                                                              |
 | `Regression`        | `MSELoss`                        | *(none)*                                                                                                       |
 | `Ordinal_Regression`| `coral_loss`                     | `focal`, `topk10`, `topk20`, `bce_focal`, `bce_topk10`, `bce_topk20`, `weighted_bce`, `bce_mae`                |
 
@@ -259,24 +278,39 @@ model:
 
 For ordinal regression, set `num_classes` in the data config to the number of ordinal levels (e.g. `100` for ages 0–99). The CORAL head emits `num_classes - 1` logits.
 
+# Output layout and run naming
+
+A training run writes everything for one experiment to:
+
+```
+<output_dir>/<dataset_name>/<run_name>/
+├── Configs/                  <- Hydra configs for the run
+└── folds/
+    ├── 0/                    <- ModelCheckpoint files for fold 0
+    ├── 1/                    <- fold 1, if running CV
+    └── ...
+```
+
+Two fields drive this:
+
+- **`output_dir`** — the output root (e.g. `/home/jma/outputs`). Set via the env config (see below).
+- **`run_name`** — the experiment identifier. Defaults to a `YYYY-MM-DD_HH-MM-SS` timestamp if you don't set one. Override it on the CLI (`run_name=MyExperiment1`) or in a data config to get a stable, human-readable folder name.
+
+For multi-fold runs, `<run_name>` is the W&B `group` and each fold is logged as a separate run named `<run_name>_fold{k}` — so all folds stay grouped together in the W&B UI while still being separately inspectable.
+
+# Environment configs (`env=local` vs `env=cluster`)
+
+Every training command picks an environment config via `env=...`. The env config sets `output_dir` and tweaks Lightning trainer settings to match the runtime.
+
+| | `env=local` | `env=cluster` |
+|---|---|---|
+| `output_dir` source | Hard-coded path in [`configs/env/local.yaml`](configs/env/local.yaml) — edit `<path_to_output>` to your local output directory. | Reads the `EXPERIMENT_LOCATION` environment variable. Falls back to the `<path_to_output>` placeholder in [`configs/env/cluster.yaml`](configs/env/cluster.yaml) if you'd rather hard-code it. |
+| Progress bar | Rich progress bar (inherited from `train.yaml` default). | TQDM progress bar (better behaved in non-TTY job logs). |
+| Typical use | Interactive runs on your workstation. | Batch / SLURM jobs where the output root is set per-job via env var. |
+
+For `env=cluster`, the recommended workflow is to `export EXPERIMENT_LOCATION=/path/to/exp` in your job script before invoking `python main.py …`. If you don't want to use the env var, just replace `<path_to_output>` in `cluster.yaml` with a hard path.
+
 # Training
-### Primus-M
-Fine-tuning:
-
-`python main.py env=cluster model=primus data=Datasetname  trainer.devices=1 model.pretrained=True model.chpt_path=<path/to/checkpoint>`
-
-Training from scratch:
-
-`python main.py env=cluster model=primus data=Datasetname  trainer.devices=1 model.pretrained=False`
-
-### ResEnc-L (classification)
-Fine-tuning:
-
-`python main.py env=cluster model=resenc data=Datasetname  trainer.devices=1 model.pretrained=True  model.chpt_path=<path/to/checkpoint>`
-
-Training from scratch:
-
-`python main.py env=cluster model=resenc data=Datasetname trainer.devices=1  model.pretrained=False`
 
 ### ResEnc-L — Ordinal Regression
 Uses the `ResEncoder_OrdinalRegressor` model with a CORAL-style head. The data config should set `task: 'Ordinal_Regression'` and `num_classes` to the number of ordinal levels.
@@ -297,6 +331,8 @@ To use a non-default ordinal loss (e.g. focal):
 
 `python main.py env=cluster model=resenc_ord_reg data=age_ord_reg trainer.devices=1 model.pretrained=False model.loss_fn=focal`
 
+An MLP-head variant (`ResEncoder_OrdinalRegressor_MLP`) is also available via `model=resenc_ord_reg_MLP`. It replaces the single-linear CORAL projection with a small MLP and can help when the encoder's pooled features need extra capacity before the ordinal thresholds.
+
 ### ResEnc-L — Regression
 Uses the `ResEncoder_Regressor` model, which pairs the ResEnc-L backbone with a plain `RegressionHead` (pool → dropout → linear). The head emits a single scalar per sample by default; set `num_outputs` in the model config for multi-output regression. In the data config, set `task: 'Regression'`:
 
@@ -305,8 +341,6 @@ model:
   task: 'Regression'
   loss_fn: null   # MSELoss
 ```
-
-> **Note:** the matching model config `cli_configs/model/resenc_reg.yaml` has not been written yet. It can mirror `resenc_ord_reg.yaml` with `_target_: models.resenc.ResEncoder_Regressor`. Once added, training is launched the same way as the other variants:
 
 Fine-tuning:
 

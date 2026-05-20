@@ -24,7 +24,7 @@ data:
   patch_size: [160, 160, 160]
 
 model:
-  task: 'Ordinal_Regression' #'Classification'
+  task: 'Ordinal_Regression'
   loss_fn: null # focal, topk10, topk20, bce_focal, bce_topk10, bce_topk20, weighted_bce, bce_mae
   cifar_size: False
   input_channels: 1
@@ -37,6 +37,8 @@ model:
   weight_decay: 1e-2
   finetune_method: full_sawtooth
 
+
+run_name: Refactored_Test
 
 trainer:
   logger:

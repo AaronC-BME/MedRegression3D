@@ -5,10 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-VALID_TASKS = ("Classification", "Regression", "Ordinal_Regression")
+VALID_TASKS = ("Regression", "Ordinal_Regression")
 
 _VALID_LOSS_FNS = {
-    "Classification": (None, "focal", "topk10"),
     "Regression": (None,),
     "Ordinal_Regression": (
         None, "focal", "topk10", "topk20",
@@ -18,7 +17,7 @@ _VALID_LOSS_FNS = {
 }
 
 
-def _build_criterion(task, loss_fn, label_smoothing, subtask):
+def _build_criterion(task, loss_fn, label_smoothing):
     """Return the loss callable for a given (task, loss_fn) pair."""
     if task not in VALID_TASKS:
         raise ValueError(f"Unknown task: {task!r}. Expected one of {VALID_TASKS}.")
@@ -29,20 +28,6 @@ def _build_criterion(task, loss_fn, label_smoothing, subtask):
             f"Unknown loss_fn={loss_fn!r} for task={task!r}. "
             f"Valid options are: {valid}."
         )
-
-    if task == "Classification":
-        if loss_fn is None:
-            if subtask == "multiclass":
-                return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-            if subtask == "multilabel":
-                return nn.BCEWithLogitsLoss()
-            raise ValueError(f"Unknown subtask: {subtask!r}")
-        if loss_fn == "focal":
-            print("Using Focal loss for Classification")
-            return FocalLoss()
-        if loss_fn == "topk10":
-            print("Using Topk10 loss for Classification")
-            return TopKLoss()
 
     if task == "Regression":
         return nn.MSELoss()
@@ -76,36 +61,6 @@ def _build_criterion(task, loss_fn, label_smoothing, subtask):
             return combined_coral_mae_loss
 
     raise ValueError(f"Unhandled (task, loss_fn) pair: ({task!r}, {loss_fn!r}).")
-
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=1.0, gamma=2.0, reduction="mean"):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-        pt = torch.exp(-ce_loss)  # softmax prob of the correct class
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean() if self.reduction == "mean" else focal_loss.sum()
-
-
-class TopKLoss(nn.Module):
-    def __init__(self, k=10, reduction="mean"):
-        super().__init__()
-        self.k = k
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')  # shape: (B,)
-        k = max(1, int(len(ce_loss) * self.k / 100))  # top k% elements
-        topk_loss, _ = torch.topk(ce_loss, k)
-        if self.reduction == "mean":
-            return topk_loss.mean()
-        else:
-            return topk_loss.sum()
 
 
 def coral_loss(logits, levels, importance_weights=None):

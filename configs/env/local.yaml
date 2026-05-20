@@ -1,3 +1,2 @@
 # @package _global_
-exp_dir: '/home/sumin/Documents/SSL3D_classification/experiments/'
-data_dir: '/home/sumin/Documents/nnssl_test/nnssl_data/nnssl_preprocessed/'
+output_dir: <path_to_output>

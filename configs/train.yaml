@@ -2,9 +2,10 @@ defaults:
   - _self_
   - env: local
   - model: resnet
-  - data: cifar10
+  - data: ???  # specify via CLI: data=<config_name>
 
-output_subdir: ${exp_dir}/${data.module.name}/checkpoints/${make_group_name:}
+run_name: ${make_group_name:}  # override to give the run a stable name (e.g. run_name=MyExperiment); default is a timestamp
+output_subdir: ${output_dir}/${data.module.name}/${run_name}/Configs
 hydra:
   output_subdir: ${output_subdir}
   job:
@@ -39,8 +40,7 @@ model:
   zero_init_residual: False
   input_dim: 2
   input_channels: 3
-  task: 'Classification'
-  subtask: 'multiclass'  # 'multilabel'
+  task: 'Ordinal_Regression'  # 'Regression', 'Ordinal_Regression'
   metric_computation_mode: 'epochwise'
   result_plot: 'val'
   num_classes: ${data.num_classes}
@@ -48,7 +48,7 @@ model:
   epochs: ${trainer.max_epochs}
   name: ${model_name_extractor:${model._target_}}
   compile: False
-  classification_head_dropout: 0.0
+  regression_head_dropout: 0.0
   token_aggregation_method: cls_token
   pretrained: False
   finetune_method: full
@@ -65,8 +65,8 @@ data:
     k: 1  # 1=no Cross Validation
 
 metrics:
-  - 'acc'
-  - 'f1'
+  - 'mae' 
+  - 'mse'
 
 val_only: False
 
@@ -74,7 +74,7 @@ trainer:
   _target_: lightning.pytorch.Trainer
   callbacks: 
     progressbar:
-      _target_: lightning.pytorch.callbacks.RichProgressBar
+      _target_: lightning.pytorch.callbacks.TQDMProgressBar
     lr_monitor:
       _target_: lightning.pytorch.callbacks.LearningRateMonitor
       logging_interval: epoch
@@ -100,10 +100,10 @@ trainer:
   strategy: 'ddp'
   logger: 
     _target_: lightning.pytorch.loggers.WandbLogger
-    save_dir: ${exp_dir}/${data.module.name}
+    save_dir: ${output_dir}/${data.module.name}
     offline: False
     project: ${data.module.name}
-    group: ???
+    name: ${run_name}  # cli.py appends _fold{k} per fold
   num_sanity_val_steps: 0
   accumulate_grad_batches: 1
   # Some useful trainer parameters for debugging

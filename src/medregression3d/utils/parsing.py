@@ -1,5 +1,6 @@
+from datetime import datetime
+
 from omegaconf import DictConfig, OmegaConf
-from uuid import uuid4
 
 
 def make_omegaconf_resolvers():
@@ -19,5 +20,7 @@ def make_omegaconf_resolvers():
     )
     OmegaConf.register_new_resolver("model_name_extractor", lambda s: s.split(".")[-1])
     OmegaConf.register_new_resolver(
-        "make_group_name", lambda: str(uuid4()), use_cache=True
+        "make_group_name",
+        lambda: datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+        use_cache=True,
     )

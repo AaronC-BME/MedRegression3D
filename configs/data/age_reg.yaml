@@ -22,7 +22,7 @@ data:
   patch_size: [160, 160, 160]
 
 model:
-  task: 'Regression' #'Classification'
+  task: 'Regression'
   cifar_size: False
   input_channels: 1
   input_dim: 3

@@ -7,13 +7,8 @@ from timm.optim import RMSpropTF
 from torchmetrics import MetricCollection
 from torchmetrics.aggregation import CatMetric
 
-from medregression3d.data.transforms import mixup_criterion, mixup_data
-from medregression3d.evaluation.metrics import (
-    ConfusionMatrix,
-    _build_classification_metrics,
-    _build_regression_metrics,
-    _flatten_per_class_f1,
-)
+from medregression3d.data.mixup import mixup_criterion, mixup_data
+from medregression3d.evaluation.metrics import _build_regression_metrics
 from medregression3d.models.losses import (
     VALID_TASKS,
     _build_criterion,
@@ -64,40 +59,27 @@ class BaseModel(L.LightningModule):
     ):
         super().__init__()
 
-        # --- Task / subtask / loss ------------------------------------------
+        # --- Task / loss ------------------------------------------------------
         if task not in VALID_TASKS:
             raise ValueError(
                 f"Unknown task: {task!r}. Expected one of {VALID_TASKS}."
             )
         self.task = task
         self.loss_fn = loss_fn  # None => task default
-        self.subtask = kwargs["subtask"]
 
         # --- Metrics ----------------------------------------------------------
         self.metric_computation_mode = metric_computation_mode
         self.result_plot_setting = result_plot
 
-        if self.task == "Classification":
-            metric_task = self.subtask  # "multiclass" or "multilabel"
-            metrics_dict = _build_classification_metrics(metrics, metric_task, num_classes)
-        elif self.task in ("Ordinal_Regression", "Regression"):
-            metrics_dict = _build_regression_metrics(metrics)
-        else:
-            metrics_dict = {}
+        metrics_dict = _build_regression_metrics(metrics)
 
         # Result-plotting bookkeeping
         if self.result_plot_setting in ("val", "all"):
-            if self.task == "Classification":
-                self.val_conf_mat = ConfusionMatrix(num_classes=num_classes)
-            elif self.task in ("Ordinal_Regression", "Regression"):
-                self.val_pred_list = []
-                self.val_label_list = []
+            self.val_pred_list = []
+            self.val_label_list = []
         if self.result_plot_setting == "all":
-            if self.task == "Classification":
-                self.train_conf_mat = ConfusionMatrix(num_classes=num_classes)
-            elif self.task in ("Ordinal_Regression", "Regression"):
-                self.train_pred_list = []
-                self.train_label_list = []
+            self.train_pred_list = []
+            self.train_label_list = []
 
         self.save_preds = bool(kwargs["save_preds"])
         if self.save_preds:
@@ -149,7 +131,7 @@ class BaseModel(L.LightningModule):
 
         # --- Loss -------------------------------------------------------------
         self.criterion = _build_criterion(
-            self.task, self.loss_fn, self.label_smoothing, self.subtask,
+            self.task, self.loss_fn, self.label_smoothing,
         )
 
     # -----------------------------------------------------------------------
@@ -194,24 +176,17 @@ class BaseModel(L.LightningModule):
                 )
             return self.criterion(y_hat, levels)
 
-        target = y.float() if self.subtask == "multilabel" else y.long()
-        return self.criterion(y_hat, target)
+        return self.criterion(y_hat, y.float())
 
     def _update_metrics(self, metrics_obj, y_hat, y):
         """Update an epochwise MetricCollection with predictions in the right form."""
-        if self.task == "Classification":
-            if self.subtask == "multilabel":
-                metrics_obj.update(torch.sigmoid(y_hat.detach()), y)
-            else:  # multiclass
-                metrics_obj.update(F.softmax(y_hat.detach(), dim=-1), y)
-        elif self._is_ordinal:
+        if self._is_ordinal:
             pred_classes = (torch.sigmoid(y_hat.detach()) > 0.5).int().sum(dim=1)
             metrics_obj.update(pred_classes, y)
         else:
             metrics_obj.update(y_hat.view(-1).detach(), y.view(-1))
 
     def _log_metrics(self, metrics_res, prefix):
-        _flatten_per_class_f1(metrics_res, prefix)
         self.log_dict(
             metrics_res,
             on_step=False,
@@ -285,8 +260,6 @@ class BaseModel(L.LightningModule):
             self._update_metrics(self.train_metrics, y_hat, y)
 
         # Optional plot bookkeeping
-        if hasattr(self, "train_conf_mat"):
-            self.train_conf_mat.update(y_hat, y)
         if hasattr(self, "train_pred_list"):
             self.train_pred_list.extend(y_hat)
             self.train_label_list.extend(y)
@@ -317,8 +290,6 @@ class BaseModel(L.LightningModule):
         elif self.metric_computation_mode == "epochwise":
             self._update_metrics(self.val_metrics, y_hat, y)
 
-        if hasattr(self, "val_conf_mat"):
-            self.val_conf_mat.update(y_hat, y)
         if hasattr(self, "val_preds"):
             actual_batch_size = x.size(0)
             start_idx = batch_idx * self.trainer.val_dataloaders.batch_size
@@ -346,27 +317,7 @@ class BaseModel(L.LightningModule):
 
     def _log_val_predictions_table(self, preds_all, labels_all):
         """Log per-sample prediction table to W&B based on task type."""
-        if self.task == "Classification":
-            columns = (
-                ["GT_" + str(i) for i in range(len(labels_all[0]))]
-                if self.subtask == "multilabel"
-                else ["GT"]
-            ) + ["Pred_" + str(i) for i in range(len(preds_all[0]))]
-            data = [
-                (
-                    (x.tolist() if self.subtask == "multilabel" else [x])
-                    + (
-                        F.softmax(y, dim=-1)
-                        if self.subtask == "multiclass"
-                        else torch.sigmoid(y)
-                    ).tolist()
-                )
-                for x, y in zip(labels_all, preds_all)
-            ]
-            table = wandb.Table(data=data, columns=columns)
-            wandb.log({"Val Predictions": table})
-
-        elif self.task == "Regression":
+        if self.task == "Regression":
             data = [[x.item(), y.item()] for x, y in zip(labels_all, preds_all)]
             table = wandb.Table(data=data, columns=["GT", "Pred"])
             wandb.log({"Val Predictions": table})
@@ -405,10 +356,6 @@ class BaseModel(L.LightningModule):
             self._log_metrics(metrics_res, "Val/")
             self.val_metrics.reset()
 
-        if hasattr(self, "val_conf_mat"):
-            self.val_conf_mat.save_state(self, "val")
-            self.val_conf_mat.reset()
-
         if hasattr(self, "val_preds"):
             preds_all = self.val_preds.compute()
             labels_all = self.val_labels.compute()
@@ -434,10 +381,6 @@ class BaseModel(L.LightningModule):
             metrics_res = self.train_metrics.compute()
             self._log_metrics(metrics_res, "Train/")
             self.train_metrics.reset()
-
-        if hasattr(self, "train_conf_mat"):
-            self.train_conf_mat.save_state(self, "train")
-            self.train_conf_mat.reset()
 
         if hasattr(self, "train_pred_list"):
             data = [

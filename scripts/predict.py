@@ -1,4 +1,3 @@
-import glob
 import os
 from pathlib import Path
 
@@ -9,8 +8,15 @@ import torch
 import matplotlib.pyplot as plt
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
+from torch.utils.data import DataLoader
 
+from medregression3d.data.datamodules import AgeReg_Data
 from medregression3d.utils.parsing import make_omegaconf_resolvers
+
+
+CONFIG_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "configs")
+)
 
 
 def _select_best_ckpt(ckp_paths, prefer_best=True):
@@ -141,34 +147,102 @@ def _plot_error_bars(bin_df, title, out_path, metric="MAE"):
     print(f"  saved plot: {out_path}")
 
 
-def _save_bin_report(targets, preds, tag, exp_dir, bin_width=10, max_age=100):
+def _save_bin_report(targets, preds, tag, pred_dir, bin_width=10, max_age=100):
     """
     Compute age-binned errors, save them as CSV, and produce MAE / MeanError
     bar charts. `tag` is used in filenames.
     """
     bin_df = _bin_errors_by_age(targets, preds, bin_width=bin_width, max_age=max_age)
 
-    csv_path = os.path.join(exp_dir, f"error_by_age_bin_{tag}.csv")
+    csv_path = os.path.join(pred_dir, f"error_by_age_bin_{tag}.csv")
     bin_df.to_csv(csv_path, index=False)
     print(f"[{tag}] saved per-bin error stats to {csv_path}")
 
     _plot_error_bars(
         bin_df,
         title=f"MAE per age bin ({tag})",
-        out_path=os.path.join(exp_dir, f"error_by_age_bin_{tag}_MAE.png"),
+        out_path=os.path.join(pred_dir, f"error_by_age_bin_{tag}_MAE.png"),
         metric="MAE",
     )
     _plot_error_bars(
         bin_df,
         title=f"Mean signed error per age bin ({tag})",
-        out_path=os.path.join(exp_dir, f"error_by_age_bin_{tag}_MeanError.png"),
+        out_path=os.path.join(pred_dir, f"error_by_age_bin_{tag}_MeanError.png"),
         metric="MeanError",
     )
 
     return bin_df
 
 
-def _run_split(split, model, dataset, trainer, fold_id, cfg, bin_width, max_age):
+def _build_predict_manifest(data_dir, label_column, manifest_path):
+    """List .b2nd files under data_dir and write a synthetic CSV that AgeReg_Data accepts.
+
+    All rows are labeled split='test', fold=0, with a dummy label value of 0. Ground-truth
+    labels aren't available in predict-mode, so metrics are skipped downstream.
+    """
+    images = sorted(p.stem for p in Path(data_dir).glob("*.b2nd"))
+    if not images:
+        raise FileNotFoundError(f"No .b2nd files found under {data_dir}")
+    df = pd.DataFrame({
+        "image_name": images,
+        "split": "test",
+        "fold": 0,
+        label_column: 0.0,
+    })
+    df.to_csv(manifest_path, index=False)
+    return images
+
+
+def _run_data_dir_predict(model, training_cfg, trainer, data_dir, pred_dir, fold_id):
+    """Predict on every .b2nd in data_dir; save predictions only (no metrics)."""
+    label_column = training_cfg.data.module.get("label_column", "label")
+    batch_size = int(training_cfg.data.module.batch_size)
+    num_workers = int(training_cfg.data.module.get("num_workers", 4))
+
+    manifest_path = os.path.join(pred_dir, "_predict_manifest.csv")
+    image_ids = _build_predict_manifest(data_dir, label_column, manifest_path)
+    print(f"[data_dir] manifest with {len(image_ids)} images written to {manifest_path}")
+
+    test_transforms = instantiate(training_cfg.data.module.test_transforms)
+
+    predict_ds = AgeReg_Data(
+        img_dir=str(data_dir),
+        csv_file=manifest_path,
+        split="test",
+        fold=0,
+        label_column=label_column,
+        transform=test_transforms,
+        train=False,
+    )
+
+    loader = DataLoader(
+        predict_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    predictions = trainer.predict(model, dataloaders=loader)
+    _, y_hats = zip(*predictions)
+    probas = torch.cat([p.detach().cpu() for (_, p) in y_hats], dim=0)
+    preds = (probas > 0.5).sum(dim=1).float()
+
+    if len(image_ids) != len(preds):
+        raise RuntimeError(
+            f"[data_dir] Length mismatch: {len(image_ids)} ids vs {len(preds)} preds."
+        )
+
+    df = pd.DataFrame({
+        "PatientID": image_ids,
+        "Prediction": preds.numpy(),
+    })
+    out_path = os.path.join(pred_dir, f"predictions_data_dir_fold{fold_id}.xlsx")
+    df.to_excel(out_path, index=False)
+    print(f"[data_dir] Saved {len(df)} predictions to {out_path}")
+
+
+def _run_split(split, model, dataset, trainer, fold_id, pred_dir, bin_width, max_age):
     """
     Run inference on one split ('val' or 'test'), save per-case predictions,
     age-bin reports, and a per-split summary CSV. Returns the metrics dict.
@@ -212,7 +286,7 @@ def _run_split(split, model, dataset, trainer, fold_id, cfg, bin_width, max_age)
         "AbsError": (preds - targets).abs().numpy(),
         "Error": (preds - targets).numpy(),
     })
-    pred_path = os.path.join(cfg.exp_dir, f"predictions_{split}_fold{fold_id}.xlsx")
+    pred_path = os.path.join(pred_dir, f"predictions_{split}_fold{fold_id}.xlsx")
     df.to_excel(pred_path, index=False)
     print(f"[fold {fold_id} / {split}] Saved predictions to {pred_path}")
 
@@ -220,7 +294,7 @@ def _run_split(split, model, dataset, trainer, fold_id, cfg, bin_width, max_age)
     _save_bin_report(
         targets, preds,
         tag=f"{split}_fold{fold_id}",
-        exp_dir=cfg.exp_dir,
+        pred_dir=pred_dir,
         bin_width=bin_width,
         max_age=max_age,
     )
@@ -231,14 +305,14 @@ def _run_split(split, model, dataset, trainer, fold_id, cfg, bin_width, max_age)
         summary_df[col] = summary_df[col].apply(
             lambda v: round(v, 4) if isinstance(v, (int, float)) and not pd.isna(v) else v
         )
-    summary_path = os.path.join(cfg.exp_dir, f"summary_{split}.csv")
+    summary_path = os.path.join(pred_dir, f"summary_{split}.csv")
     summary_df.to_csv(summary_path, index=False)
     print(f"[fold {fold_id} / {split}] Saved summary to {summary_path}")
 
     return metrics
 
 
-@hydra.main(version_base=None, config_path="./cli_configs", config_name="infer")
+@hydra.main(version_base=None, config_path=CONFIG_DIR, config_name="infer")
 def inference(cfg):
     try:
         Path("./main.log").unlink()
@@ -249,10 +323,15 @@ def inference(cfg):
     bin_width = int(cfg.get("age_bin_width", 10))
     max_age = int(cfg.get("age_bin_max", 100))
 
-    # Single-fold inference for now. Default to fold 0 unless overridden.
+    # Resolve directories from the single run_dir input.
+    # Layout expected: <run_dir>/{Configs/config.yaml, folds/<k>/*.ckpt}
+    run_dir = Path(cfg.run_dir)
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"run_dir does not exist: {run_dir}")
+
     fold_id = str(cfg.fold) if cfg.get("fold") is not None else "0"
 
-    ckp_dir = Path(cfg.ckpt_dir) / fold_id
+    ckp_dir = run_dir / "folds" / fold_id
     ckp_list = list(ckp_dir.glob("*.ckpt"))
     if not ckp_list:
         raise FileNotFoundError(f"No checkpoints found under {ckp_dir}")
@@ -262,17 +341,20 @@ def inference(cfg):
         raise FileNotFoundError(f"No usable checkpoint selected from {ckp_dir}")
     print(f"[fold {fold_id}] using checkpoint: {ckp_path}")
 
-    # Locate training config
-    matches = glob.glob(os.path.join(cfg.exp_dir, "*/config.yaml"))
-    if not matches:
+    # Locate training config snapshot
+    training_config_path = run_dir / "Configs" / "config.yaml"
+    if not training_config_path.is_file():
         raise FileNotFoundError(
-            f"No config.yaml found under {cfg.exp_dir}/*/config.yaml"
+            f"Training config not found at {training_config_path}"
         )
-    used_training_config_path = matches[0]
-    print(f"Using training config: {used_training_config_path}")
+    print(f"Using training config: {training_config_path}")
+
+    # Predictions / reports output directory
+    pred_dir = Path(cfg.pred_dir) if cfg.get("pred_dir") else run_dir / "predictions"
+    pred_dir.mkdir(parents=True, exist_ok=True)
 
     # Build model + datamodule + trainer from the saved training config
-    used_training_cfg = OmegaConf.load(used_training_config_path)
+    used_training_cfg = OmegaConf.load(training_config_path)
     used_training_cfg.trainer.pop("logger", None)
     used_training_cfg.trainer.pop("callbacks", None)
     used_training_cfg.model.metrics = cfg.metrics
@@ -289,21 +371,35 @@ def inference(cfg):
     model.load_state_dict(state["state_dict"])
     model.eval()
 
-    dataset = instantiate(used_training_cfg.data).module
     trainer = instantiate(used_training_cfg.trainer)
 
-    # Run both splits
-    for split in ("val", "test"):
-        _run_split(
-            split=split,
+    # Branch on whether a custom data_dir was supplied.
+    data_dir = cfg.get("data_dir")
+    if data_dir:
+        data_dir_path = Path(data_dir)
+        if not data_dir_path.is_dir():
+            raise FileNotFoundError(f"data_dir does not exist: {data_dir_path}")
+        _run_data_dir_predict(
             model=model,
-            dataset=dataset,
+            training_cfg=used_training_cfg,
             trainer=trainer,
+            data_dir=data_dir_path,
+            pred_dir=str(pred_dir),
             fold_id=fold_id,
-            cfg=cfg,
-            bin_width=bin_width,
-            max_age=max_age,
         )
+    else:
+        dataset = instantiate(used_training_cfg.data).module
+        for split in ("val", "test"):
+            _run_split(
+                split=split,
+                model=model,
+                dataset=dataset,
+                trainer=trainer,
+                fold_id=fold_id,
+                pred_dir=str(pred_dir),
+                bin_width=bin_width,
+                max_age=max_age,
+            )
 
 
 if __name__ == "__main__":

@@ -26,9 +26,6 @@ def _prepare_cfg(cfg):
     log_path = Path(cfg.trainer.logger.save_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
-    uid = cfg.output_subdir.split("/")[-1]
-    cfg.trainer.logger.group = uid
-
     if cfg.trainer.devices > 1 and cfg.trainer.accelerator == "gpu":
         cfg.trainer.sync_batchnorm = True
 
@@ -39,20 +36,18 @@ def _prepare_cfg(cfg):
             if c["_target_"] != "lightning.pytorch.callbacks.ModelCheckpoint"
         ]
 
-    return uid
 
-
-def _set_checkpoint_dir(cfg, uid):
-    """Point ModelCheckpoint at <exp_dir>/<dataset>/checkpoints/<uid>/<fold>."""
+def _set_checkpoint_dir(cfg):
+    """Point ModelCheckpoint at <output_dir>/<dataset>/<run_name>/folds/<fold>."""
     if not cfg.trainer["enable_checkpointing"]:
         return
     for cb in cfg.trainer.callbacks:
         if cb["_target_"] == "lightning.pytorch.callbacks.ModelCheckpoint":
             cb["dirpath"] = os.path.join(
-                str(cfg.exp_dir),
+                str(cfg.output_dir),
                 str(cfg.data.module.name),
-                "checkpoints",
-                uid,
+                str(cfg.run_name),
+                "folds",
                 str(cfg.data.module.fold),
             )
 
@@ -91,10 +86,8 @@ CONFIG_DIR = os.path.abspath(
 
 @hydra.main(version_base=None, config_path=CONFIG_DIR, config_name="train")
 def main(cfg):
-    uid = _prepare_cfg(cfg)
+    _prepare_cfg(cfg)
     print(OmegaConf.to_yaml(cfg))
-
-    base_run_name = cfg.trainer.logger.get("name", None)
 
     for k in range(cfg.data.cv.k):
         if cfg.data.cv.k > 1:
@@ -102,10 +95,9 @@ def main(cfg):
         elif cfg.data.module.fold is None:
             cfg.data.module.fold = "0"
 
-        if base_run_name:
-            cfg.trainer.logger.name = f"{base_run_name}_fold{cfg.data.module.fold}"
+        cfg.trainer.logger.name = f"{cfg.run_name}_fold{cfg.data.module.fold}"
 
-        _set_checkpoint_dir(cfg, uid)
+        _set_checkpoint_dir(cfg)
 
         trainer = instantiate(cfg.trainer)
         model = instantiate(cfg.model)

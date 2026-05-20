@@ -23,7 +23,7 @@ data:
   patch_size: [160, 160, 160]
 
 model:
-  task: 'Ordinal_Regression' #'Classification'
+  task: 'Ordinal_Regression'
   loss_fn: null # focal, topk10, topk20, bce_focal, bce_topk10, bce_topk20, weighted_bce, bce_mae
   cifar_size: False
   input_channels: 1
@@ -40,7 +40,6 @@ model:
 trainer:
   logger:
     project: <wandb_project_name>
-    name: <wandb_run_name>
   accumulate_grad_batches: 48
   max_epochs: 200
   sync_batchnorm: True

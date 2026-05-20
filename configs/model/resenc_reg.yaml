@@ -3,7 +3,7 @@ model:
   _target_: medregression3d.models.backbones.resenc.ResEncoder_Regressor
   pretrained: False
   chpt_path: null
-  classification_head_dropout: 0.2
+  regression_head_dropout: 0.2
   finetune_method: full
   token_aggregation_method: null
 

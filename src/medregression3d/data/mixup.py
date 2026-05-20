@@ -9,13 +9,6 @@ import numpy as np
 import torch
 
 
-class BaseTransform(object):
-    def __init__(self):
-        pass
-
-    def __call__(self) -> Any:
-        pass
-
 
 @torch.no_grad()
 def mixup_data(x, y, alpha=1.0, use_cuda=True):
