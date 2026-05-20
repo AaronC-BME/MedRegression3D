@@ -40,6 +40,7 @@ model:
 trainer:
   logger:
     project: <wandb_project_name>
+    name: <wandb_run_name> # This run name also apply to the run name that is being saved locally.
   accumulate_grad_batches: 48
   max_epochs: 200
   sync_batchnorm: True

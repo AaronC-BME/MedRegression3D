@@ -37,8 +37,8 @@ def _prepare_cfg(cfg):
         ]
 
 
-def _set_checkpoint_dir(cfg):
-    """Point ModelCheckpoint at <output_dir>/<dataset>/<run_name>/folds/<fold>."""
+def _set_checkpoint_dir(cfg, base_name):
+    """Point ModelCheckpoint at <output_dir>/<dataset>/<base_name>/folds/<fold>."""
     if not cfg.trainer["enable_checkpointing"]:
         return
     for cb in cfg.trainer.callbacks:
@@ -46,7 +46,7 @@ def _set_checkpoint_dir(cfg):
             cb["dirpath"] = os.path.join(
                 str(cfg.output_dir),
                 str(cfg.data.module.name),
-                str(cfg.run_name),
+                str(base_name),
                 "folds",
                 str(cfg.data.module.fold),
             )
@@ -89,15 +89,21 @@ def main(cfg):
     _prepare_cfg(cfg)
     print(OmegaConf.to_yaml(cfg))
 
+    # `trainer.logger.name` is the source of truth for both the W&B run name
+    # and the on-disk run folder. Capture the base before the fold loop so
+    # all folds share one parent dir even though their W&B names differ.
+    base_name = cfg.trainer.logger.name
+
     for k in range(cfg.data.cv.k):
         if cfg.data.cv.k > 1:
             cfg.data.module.fold = k
         elif cfg.data.module.fold is None:
             cfg.data.module.fold = "0"
 
-        cfg.trainer.logger.name = f"{cfg.run_name}_fold{cfg.data.module.fold}"
+        if cfg.data.cv.k > 1:
+            cfg.trainer.logger.name = f"{base_name}_fold{cfg.data.module.fold}"
 
-        _set_checkpoint_dir(cfg)
+        _set_checkpoint_dir(cfg, base_name)
 
         trainer = instantiate(cfg.trainer)
         model = instantiate(cfg.model)

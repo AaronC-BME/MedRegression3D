@@ -4,8 +4,7 @@ defaults:
   - model: resnet
   - data: ???  # specify via CLI: data=<config_name>
 
-run_name: ${make_group_name:}  # override to give the run a stable name (e.g. run_name=MyExperiment); default is a timestamp
-output_subdir: ${output_dir}/${data.module.name}/${run_name}/Configs
+output_subdir: ${output_dir}/${data.module.name}/${trainer.logger.name}/Configs
 hydra:
   output_subdir: ${output_subdir}
   job:
@@ -103,7 +102,7 @@ trainer:
     save_dir: ${output_dir}/${data.module.name}
     offline: False
     project: ${data.module.name}
-    name: ${run_name}  # cli.py appends _fold{k} per fold
+    name: ${make_group_name:}  # default = timestamp; override in data config or via CLI. cli.py appends _fold{k} only when cv.k > 1.
   num_sanity_val_steps: 0
   accumulate_grad_batches: 1
   # Some useful trainer parameters for debugging

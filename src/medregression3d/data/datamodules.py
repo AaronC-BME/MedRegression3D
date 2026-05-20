@@ -121,20 +121,32 @@ class AgeReg_DataModule(BaseDataModule):
             label_column=self.label_column,
             fold=self.fold,
         )
-        self.train_dataset = AgeReg_Data(
-            **common,
-            split="train",
-            transform=self.train_transforms,
-        )
-        self.val_dataset = AgeReg_Data(
-            **common,
-            split="val",
-            transform=self.test_transforms,
-            train=False,
-        )
-        self.test_dataset = AgeReg_Data(
-            **common,
-            split="test",
-            transform=self.test_transforms,
-            train=False,
-        )
+
+        # Peek at the CSV once to find which splits actually exist for this
+        # fold. Missing splits (e.g. no test set) are skipped silently rather
+        # than raising during setup.
+        df = pd.read_csv(self.csv_file)
+        df["fold"] = df["fold"].astype(int)
+        df["split"] = df["split"].astype(str).str.lower()
+        available = set(df[df["fold"] == int(self.fold)]["split"].unique())
+
+        if "train" in available:
+            self.train_dataset = AgeReg_Data(
+                **common,
+                split="train",
+                transform=self.train_transforms,
+            )
+        if "val" in available:
+            self.val_dataset = AgeReg_Data(
+                **common,
+                split="val",
+                transform=self.test_transforms,
+                train=False,
+            )
+        if "test" in available:
+            self.test_dataset = AgeReg_Data(
+                **common,
+                split="test",
+                transform=self.test_transforms,
+                train=False,
+            )

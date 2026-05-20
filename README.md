@@ -75,7 +75,9 @@ Notes:
 
 # Dataset preprocessing
 
-Two preprocessing scripts are provided, one per modality: [`CT_preprocessing.py`](/datasets/preprocess_3D_data/datasets/CT_preprocessing.py) for CT and [`MRI_preprocessing.py`](/datasets/preprocess_3D_data/datasets/MRI_preprocessing.py) for MRI. Both take a directory of `.nii.gz` images, resample to a target spacing (default 1mm isotropic), crop to the non-zero bounding box, normalize, and save as Blosc2 (`.b2nd`) — preserving the full resampled volume. Random 160³ patch extraction happens at training time via `batchgenerators`, not during preprocessing.
+Two preprocessing scripts are provided, one per modality: [`scripts/preprocess_ct.py`](scripts/preprocess_ct.py) for CT and [`scripts/preprocess_mri.py`](scripts/preprocess_mri.py) for MRI. Both take one or more directories of `.nii.gz` images, resample to a target spacing (defaults to the per-axis **median** across the input dataset; override with `--target-spacing Z Y X`), crop to the non-zero bounding box, normalize, and save as Blosc2 (`.b2nd`) — preserving the full resampled volume. Center 160³ patches are extracted at training time via `batchgenerators`, not during preprocessing.
+
+Both scripts accept `--in-dir` multiple times in one invocation (e.g. `--in-dir imagesTr imagesVal`), so train/val image folders end up in the same output directory at a consistent spacing.
 
 See the per-modality sections below for the normalization details, which differ between CT and MRI.
 
@@ -87,7 +89,7 @@ The data module doesn't enforce a layout — it just needs `img_dir` (a folder o
 dataset/
 └── <data_name>/
     ├── raw/                <- original .nii.gz files (kept for re-preprocessing)
-    ├── preprocessed/       <- .b2nd output from CT_preprocessing.py / MRI_preprocessing.py
+    ├── preprocessed/       <- .b2nd output from scripts/preprocess_ct.py / scripts/preprocess_mri.py
     └── split_labels.csv    <- splits/labels/folds CSV
 ```
 
@@ -100,22 +102,32 @@ csv_file: dataset/<data_name>/split_labels.csv
 
 ## CT preprocessing
 
-For CT datasets, use [`CT_preprocessing.py`](/datasets/preprocess_3D_data/datasets/CT_preprocessing.py). The script is dataset-agnostic and works on any CT dataset given a directory of `.nii.gz` images.
+For CT datasets, use [`scripts/preprocess_ct.py`](scripts/preprocess_ct.py). The script is dataset-agnostic and works on any CT dataset given one or more directories of `.nii.gz` images.
 
 The pipeline runs in two passes:
 
 **Pass 1 — Compute dataset-wide intensity statistics.** Scans all `.nii.gz` files once, sampling up to 10,000 foreground voxels per case (HU > -500). Aggregates global mean, std, and 0.5 / 99.5 percentiles. You can skip this pass by supplying stats directly via `--stats-mean`, `--stats-std`, `--stats-pct-00-5`, and `--stats-pct-99-5`.
 
 **Pass 2 — Per-case processing.**
-1. Resample to a target spacing (default 1×1×1 mm isotropic). Cases already at the target spacing skip this step automatically.
+1. Resample to a target spacing. By default the script reads headers across every input image, takes the per-axis median spacing, and uses that. Override with `--target-spacing Z Y X` to force a specific spacing (e.g. `1 1 1` for 1mm isotropic). Cases already at the target spacing skip resampling automatically.
 2. Crop to the non-zero bounding box (trims zero-padded edges; CT air at -1000 HU is preserved).
 3. CT-normalize: clip to the dataset-wide `[percentile_00_5, percentile_99_5]` range, then z-score using the dataset-wide mean and std.
 4. Save as Blosc2 at `<out-root>/<dataset-name>/<image_id>.b2nd`.
 
 ### Example usage
 
+Auto-median spacing across train + val splits:
 ```bash
-python datasets/preprocess_3D_data/datasets/CT_preprocessing.py \
+python scripts/preprocess_ct.py \
+    --in-dir /path/to/raw/CT/imagesTr /path/to/raw/CT/imagesVal \
+    --out-root /path/to/preprocessed_data \
+    --dataset-name Dataset001_LiverROI \
+    --num-workers 8
+```
+
+Force 1mm isotropic spacing:
+```bash
+python scripts/preprocess_ct.py \
     --in-dir /path/to/raw/CT/images \
     --out-root /path/to/preprocessed_data \
     --dataset-name Dataset001_LiverROI \
@@ -127,31 +139,41 @@ python datasets/preprocess_3D_data/datasets/CT_preprocessing.py \
 
 | Flag | Description |
 |---|---|
-| `--in-dir` | Directory of raw `.nii.gz` CT images. |
+| `--in-dir` | One or more directories of raw `.nii.gz` CT images. Stats and median spacing span all of them. |
 | `--out-root` | Output root. The script writes to `<out-root>/<dataset-name>/<image_id>.b2nd`. |
 | `--dataset-name` | Name of the dataset folder (e.g. `Dataset001_LiverROI`). |
-| `--target-spacing Z Y X` | Target voxel spacing in mm. Default `1 1 1`. |
+| `--target-spacing Z Y X` | Target voxel spacing in mm. **Optional.** If omitted, defaults to the per-axis median spacing across all input images. |
 | `--skip-resample` | Skip the resampling step entirely (use native spacing). |
-| `--num-workers` | Parallel processes for both passes. Default `8`. |
+| `--num-workers` | Parallel processes for the stats / spacing / per-case passes. Default `8`. |
 | `--stats-mean / --stats-std / --stats-pct-00-5 / --stats-pct-99-5` | Optional pre-supplied stats; bypasses Pass 1. All four must be set together. |
 
 ## MRI preprocessing
 
-For MRI datasets, use [`MRI_preprocessing.py`](/datasets/preprocess_3D_data/datasets/MRI_preprocessing.py). The structure mirrors `CT_preprocessing.py` but with two key differences:
+For MRI datasets, use [`scripts/preprocess_mri.py`](scripts/preprocess_mri.py). The structure mirrors `preprocess_ct.py` but with two key differences:
 
 - **No dataset-wide stats pass.** MRI has no absolute intensity reference (unlike CT's HU scale), so intensities are not comparable across scanners or sequences. Each case is z-scored independently on its own foreground.
 - **Foreground = voxels > 0.** This assumes the input MRIs are skull-stripped or otherwise have a zero background. For data with non-zero air background, mask it out first.
 
 The per-case pipeline:
-1. Resample to a target spacing (default 1×1×1 mm isotropic).
+1. Resample to a target spacing. By default the script reads headers across every input image, takes the per-axis median spacing, and uses that. Override with `--target-spacing Z Y X`.
 2. Crop to the non-zero bounding box (typically trims a sizeable margin on skull-stripped MRI).
 3. Per-case z-score normalization on the foreground mask.
 4. Save as Blosc2 at `<out-root>/<dataset-name>/<image_id>.b2nd`.
 
 ### Example usage
 
+Auto-median spacing across train + val splits:
 ```bash
-python datasets/preprocess_3D_data/datasets/MRI_preprocessing.py \
+python scripts/preprocess_mri.py \
+    --in-dir /path/to/raw/MRI/imagesTr /path/to/raw/MRI/imagesVal \
+    --out-root /path/to/preprocessed_data \
+    --dataset-name Dataset017_OpenNeuro \
+    --num-workers 8
+```
+
+Force 1mm isotropic spacing:
+```bash
+python scripts/preprocess_mri.py \
     --in-dir /path/to/raw/MRI/images \
     --out-root /path/to/preprocessed_data \
     --dataset-name Dataset017_OpenNeuro \
@@ -163,10 +185,10 @@ python datasets/preprocess_3D_data/datasets/MRI_preprocessing.py \
 
 | Flag | Description |
 |---|---|
-| `--in-dir` | Directory of raw `.nii.gz` MR images. |
+| `--in-dir` | One or more directories of raw `.nii.gz` MR images. Median spacing spans all of them. |
 | `--out-root` | Output root. The script writes to `<out-root>/<dataset-name>/<image_id>.b2nd`. |
 | `--dataset-name` | Name of the dataset folder (e.g. `Dataset017_OpenNeuro`). |
-| `--target-spacing Z Y X` | Target voxel spacing in mm. Default `1 1 1`. |
+| `--target-spacing Z Y X` | Target voxel spacing in mm. **Optional.** If omitted, defaults to the per-axis median spacing across all input images. |
 | `--skip-resample` | Skip the resampling step entirely. |
 | `--num-workers` | Parallel processes. Default `8`. |
 
@@ -176,7 +198,7 @@ If your dataset can be described as "a directory of preprocessed `.b2nd` files p
 
 ## The common case: reuse `AgeReg_DataModule`
 
-1. **Preprocess your data** with `CT_preprocessing.py` or `MRI_preprocessing.py` to produce `<out-root>/<dataset-name>/<image_id>.b2nd` files.
+1. **Preprocess your data** with `scripts/preprocess_ct.py` or `scripts/preprocess_mri.py` to produce `<out-root>/<dataset-name>/<image_id>.b2nd` files.
 
 2. **Build a CSV** with `image_name`, `split`, `fold`, and a label column. See the [Data CSV format](#data-csv-format) section for the schema.
 
@@ -283,7 +305,7 @@ For ordinal regression, set `num_classes` in the data config to the number of or
 A training run writes everything for one experiment to:
 
 ```
-<output_dir>/<dataset_name>/<run_name>/
+<output_dir>/<dataset_name>/<trainer.logger.name>/
 ├── Configs/                  <- Hydra configs for the run
 └── folds/
     ├── 0/                    <- ModelCheckpoint files for fold 0
@@ -294,9 +316,9 @@ A training run writes everything for one experiment to:
 Two fields drive this:
 
 - **`output_dir`** — the output root (e.g. `/home/jma/outputs`). Set via the env config (see below).
-- **`run_name`** — the experiment identifier. Defaults to a `YYYY-MM-DD_HH-MM-SS` timestamp if you don't set one. Override it on the CLI (`run_name=MyExperiment1`) or in a data config to get a stable, human-readable folder name.
+- **`trainer.logger.name`** — the experiment identifier. Used as both the W&B run name and the on-disk folder name. Defaults to a `YYYY-MM-DD_HH-MM-SS` timestamp if you don't set one. Override it on the CLI (`trainer.logger.name=MyExperiment1`) or in a data config to get a stable, human-readable name.
 
-For multi-fold runs, `<run_name>` is the W&B `group` and each fold is logged as a separate run named `<run_name>_fold{k}` — so all folds stay grouped together in the W&B UI while still being separately inspectable.
+For multi-fold runs, `cli.py` appends `_fold{k}` to the W&B run name per fold while keeping the on-disk folder name unchanged — so all folds share one parent directory but each appears as its own run in W&B.
 
 # Environment configs (`env=local` vs `env=cluster`)
 
@@ -401,13 +423,13 @@ python scripts/predict.py
 
 Override `run_dir` on the CLI:
 ```bash
-python scripts/predict.py run_dir=/path/to/<output_dir>/<dataset>/<run_name>
+python scripts/predict.py run_dir=/path/to/<output_dir>/<dataset>/<trainer.logger.name>
 ```
 
 Predict on a directory of new images:
 ```bash
 python scripts/predict.py \
-    run_dir=/path/to/<output_dir>/<dataset>/<run_name> \
+    run_dir=/path/to/<output_dir>/<dataset>/<trainer.logger.name> \
     data_dir=/path/to/new/preprocessed/b2nd/files
 ```
 

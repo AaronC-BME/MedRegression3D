@@ -389,7 +389,11 @@ def inference(cfg):
         )
     else:
         dataset = instantiate(used_training_cfg.data).module
+        dataset.setup("fit")  # build whatever splits exist in the CSV
         for split in ("val", "test"):
+            if not hasattr(dataset, f"{split}_dataset"):
+                print(f"[skip] no {split!r} split in CSV for fold {fold_id}")
+                continue
             _run_split(
                 split=split,
                 model=model,

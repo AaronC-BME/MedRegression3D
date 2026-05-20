@@ -2,7 +2,8 @@
 General-purpose MRI preprocessing for SSL3D_regression.
 
 Reads raw NIfTI MR images, then for each case:
-  1. Resamples to a target spacing (default 1mm isotropic).
+  1. Resamples to a target spacing (auto-computed median by default,
+     or set explicitly with --target-spacing).
   2. Crops to the non-zero bounding box (matches nnssl behavior).
   3. Applies per-case z-score normalization on the foreground (voxels > 0).
   4. Saves as Blosc2 in the directory layout the AgeReg dataloader expects:
@@ -10,6 +11,14 @@ Reads raw NIfTI MR images, then for each case:
 
 Notes:
   - This script is dataset-agnostic. Use --dataset-name to set the folder.
+  - --in-dir accepts one or more directories. All .nii.gz files across all
+    directories are processed into the same output folder, and the median
+    target spacing (when auto-computed) is the median across all of them.
+    Useful when train/val images live in separate folders but must end up
+    at a consistent resampled spacing.
+  - When --target-spacing is omitted, the script first does a header-only
+    pass over every input image and uses the per-axis median spacing.
+    Pass --target-spacing Z Y X to override.
   - Unlike CT, MRI has no absolute intensity reference (HU). Intensities vary
     by scanner, sequence, and acquisition, so dataset-wide stats are not
     meaningful. Each case is z-scored independently on its own foreground.
@@ -25,11 +34,10 @@ Notes:
     batchgenerators, not here. We preserve full resampled volumes.
 
 Usage:
-    python MRI_preprocessing.py \\
-        --in-dir <path_to_input_directory> \\
+    python preprocess_mri.py \\
+        --in-dir <dir_1> [<dir_2> ...] \\
         --out-root <path_to_output_root> \\
         --dataset-name <dataset_name> \\
-        --target-spacing 1 1 1 \\
         --num-workers 8
 """
 import sys
@@ -56,6 +64,15 @@ from medregression3d.data.preprocessing.default_resampling import resample_data_
 
 # Cubic interpolation for MR image data. Matches SSL3D template default.
 RESAMPLING_ORDER = 3
+
+
+def read_image_spacing(image_path: str) -> tuple:
+    """Header-only read of voxel spacing. Returns (Z, Y, X) in mm."""
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(image_path)
+    reader.ReadImageInformation()
+    # SimpleITK GetSpacing returns (x, y, z); flip to match (Z, Y, X) array order.
+    return reader.GetSpacing()[::-1]
 
 
 # --------------------------------------------------------------------------- #
@@ -146,16 +163,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--in-dir", required=True, type=Path,
-                        help="Directory containing raw .nii.gz MR images.")
+    parser.add_argument("--in-dir", required=True, type=Path, nargs="+",
+                        help="One or more directories containing raw .nii.gz MR images.")
     parser.add_argument("--out-root", required=True, type=Path,
                         help="Output root. The script will write to "
                              "<out-root>/<dataset-name>/<id>.b2nd")
     parser.add_argument("--dataset-name", required=True, type=str,
                         help="Name of the dataset folder, e.g. Dataset017_OpenNeuro.")
     parser.add_argument("--target-spacing", type=float, nargs=3,
-                        default=[1.0, 1.0, 1.0], metavar=("Z", "Y", "X"),
-                        help="Target spacing in mm as three floats: Z Y X. Default: 1 1 1.")
+                        default=None, metavar=("Z", "Y", "X"),
+                        help="Target spacing in mm as three floats: Z Y X. "
+                             "If omitted, the per-axis median spacing across "
+                             "all input images is computed and used.")
     parser.add_argument("--skip-resample", action="store_true",
                         help="Skip resampling entirely (use the data as-is).")
     parser.add_argument("--num-workers", type=int, default=8,
@@ -163,18 +182,38 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if not args.in_dir.is_dir():
-        raise SystemExit(f"--in-dir does not exist: {args.in_dir}")
+    for d in args.in_dir:
+        if not d.is_dir():
+            raise SystemExit(f"--in-dir does not exist: {d}")
 
-    image_paths = sorted(str(p) for p in args.in_dir.glob("*.nii.gz"))
+    image_paths = []
+    for d in args.in_dir:
+        image_paths.extend(sorted(str(p) for p in d.glob("*.nii.gz")))
     if not image_paths:
-        raise SystemExit(f"No .nii.gz files found in {args.in_dir}")
+        raise SystemExit(f"No .nii.gz files found in any of: {args.in_dir}")
 
-    print(f"Found {len(image_paths)} MR images.")
+    print(f"Found {len(image_paths)} MR images across {len(args.in_dir)} directory(ies).")
+
+    # ---- Resolve target spacing ---- #
     if args.skip_resample:
         print("[note] --skip-resample set. Volumes will be saved at their native spacing.")
+        target_spacing = None
+    elif args.target_spacing is not None:
+        target_spacing = tuple(args.target_spacing)
+        print(f"[note] user-specified target spacing (Z Y X): {target_spacing} mm")
     else:
-        print(f"[note] target spacing (Z Y X): {tuple(args.target_spacing)} mm")
+        print(f"\nComputing median spacing from {len(image_paths)} image headers...")
+        if args.num_workers > 1:
+            with Pool(processes=args.num_workers) as pool:
+                spacings = list(tqdm(
+                    pool.imap_unordered(read_image_spacing, image_paths),
+                    total=len(image_paths),
+                ))
+        else:
+            spacings = [read_image_spacing(p) for p in tqdm(image_paths)]
+        spacings_arr = np.asarray(spacings, dtype=np.float64)  # (N, 3) in (Z, Y, X)
+        target_spacing = tuple(np.median(spacings_arr, axis=0).tolist())
+        print(f"[note] median target spacing (Z Y X): {target_spacing} mm")
 
     # ---- Build per-case output paths and dispatch ---- #
     out_root = args.out_root / args.dataset_name
@@ -192,7 +231,7 @@ def main() -> None:
         job_args.append((
             img_path,
             out_path_truncated,
-            tuple(args.target_spacing),
+            target_spacing,
             args.skip_resample,
         ))
 

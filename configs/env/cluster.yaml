@@ -1,5 +1,5 @@
 # @package _global_
 # Reads EXPERIMENT_LOCATION env var if set, otherwise falls back to the placeholder below.
 # To skip the env var, replace the default with a hard-coded path.
-output_dir: ${oc.env:EXPERIMENT_LOCATION,"<path_to_output>"}
+output_dir: ${oc.env:EXPERIMENT_LOCATION,"/home/jma/projects/aaron/Dataset/nnssl_dataset/nnssl_results"}
 
