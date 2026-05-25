@@ -25,8 +25,8 @@ source .venv/bin/activate
 # Install PyTorch matching your CUDA driver (auto-detected)
 uv pip install torch torchvision --torch-backend=auto
 
-# Install the rest of the requirements
-uv pip install -r requirements.txt
+# Install the project (deps from pyproject.toml + medregression3d itself, editable)
+uv pip install -e .
 ```
 
 You can pin a specific CUDA build explicitly if `--torch-backend=auto` doesn't pick what you want:
