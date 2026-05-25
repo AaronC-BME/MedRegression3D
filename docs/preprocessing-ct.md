@@ -2,7 +2,16 @@
 
 For the command and argument reference, see the **Dataset preprocessing** section in the [README](../README.md).
 
-The CT script is dataset-agnostic and works on any CT dataset given one or more directories of `.nii.gz` images.
+The CT script is dataset-agnostic and works on any CT dataset given one or more directories of `.nii.gz` images. Output layout:
+
+```
+<out-root>/<dataset-name>/
+    preprocessing.json          <- modality, target spacing, CT stats (mean/std/p0.5/p99.5)
+    preprocessed_b2nd/
+        <image_id>.b2nd         <- one file per input image
+```
+
+The `preprocessing.json` sidecar records every knob needed to replay the same preprocessing at external-inference time. `cli.py` copies it into the training run's `Configs/` directory; `predict_external.py` reads it back from there. See [inference.md](inference.md) for the full flow.
 
 ## Two-pass pipeline
 

@@ -7,8 +7,17 @@ foreground (HU > -500), then for each case:
      explicitly with --target-spacing).
   2. Crops to the non-zero bounding box (matches nnssl behavior).
   3. Applies CT normalization (clip to dataset percentiles + dataset z-score).
-  4. Saves as Blosc2 in the directory layout the AgeReg dataloader expects:
-        <out_root>/<dataset-name>/<id>.b2nd
+  4. Saves as Blosc2 in this layout:
+
+        <out_root>/<dataset-name>/
+            preprocessing.json          <- modality, target spacing, dataset stats
+            preprocessed_b2nd/
+                <id>.b2nd               <- one file per input image
+
+The `preprocessing.json` sidecar lets `scripts/predict_external.py` faithfully
+replay the same preprocessing on raw NIfTI files at inference time. `cli.py`
+also copies it into each training run's `Configs/` dir so the run is
+self-describing.
 
 Notes:
   - This script is dataset-agnostic. Use --dataset-name to set the folder.
@@ -37,6 +46,8 @@ Usage:
 import sys
 import os
 import argparse
+import json
+from datetime import datetime, timezone
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Optional, List
@@ -230,8 +241,9 @@ def main() -> None:
     parser.add_argument("--in-dir", required=True, type=Path, nargs="+",
                         help="One or more directories containing raw .nii.gz CT images.")
     parser.add_argument("--out-root", required=True, type=Path,
-                        help="Output root, e.g. .../nnsslPlans_onemmiso. "
-                             "The script will write to <out-root>/<dataset-name>/<id>.b2nd")
+                        help="Output root. The script writes to "
+                             "<out-root>/<dataset-name>/preprocessed_b2nd/<id>.b2nd "
+                             "and <out-root>/<dataset-name>/preprocessing.json")
     parser.add_argument("--dataset-name", required=True, type=str,
                         help="Name of the dataset folder, e.g. Dataset001_LiverROI.")
     parser.add_argument("--target-spacing", type=float, nargs=3,
@@ -305,9 +317,33 @@ def main() -> None:
             print(f"  {k:>20s}: {v:.4f}")
 
     # ---- Build per-case output paths and dispatch ---- #
-    out_root = args.out_root / args.dataset_name
-    out_root.mkdir(parents=True, exist_ok=True)
-    print(f"\nWriting outputs to {out_root}/<id>.b2nd")
+    dataset_dir = args.out_root / args.dataset_name
+    b2nd_dir = dataset_dir / "preprocessed_b2nd"
+    b2nd_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nWriting outputs to {b2nd_dir}/<id>.b2nd")
+
+    # ---- Write preprocessing.json sidecar ---- #
+    # Records every knob predict_external.py needs to replay this preprocessing
+    # on raw NIfTI files at inference time.
+    sidecar = {
+        "modality": "ct",
+        "target_spacing": list(target_spacing) if target_spacing is not None else None,
+        "skip_resample": bool(args.skip_resample),
+        "resampling_order": RESAMPLING_ORDER,
+        "foreground_hu_threshold": CT_FOREGROUND_HU_THRESHOLD,
+        "stats": {
+            "mean": intensity_properties["mean"],
+            "std": intensity_properties["std"],
+            "percentile_00_5": intensity_properties["percentile_00_5"],
+            "percentile_99_5": intensity_properties["percentile_99_5"],
+        },
+        "preprocess_script": "preprocess_ct.py",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    sidecar_path = dataset_dir / "preprocessing.json"
+    with open(sidecar_path, "w") as f:
+        json.dump(sidecar, f, indent=2)
+    print(f"[note] wrote sidecar {sidecar_path}")
 
     job_args = []
     for img_path in image_paths:
@@ -316,7 +352,7 @@ def main() -> None:
             case_id = case_id[:-len(".nii.gz")]
         elif case_id.endswith(".nii"):
             case_id = case_id[:-len(".nii")]
-        out_path_truncated = str(out_root / case_id)
+        out_path_truncated = str(b2nd_dir / case_id)
         job_args.append((
             img_path,
             out_path_truncated,

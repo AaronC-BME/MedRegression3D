@@ -2,6 +2,17 @@
 
 For the command and argument reference, see the **Dataset preprocessing** section in the [README](../README.md).
 
+Output layout:
+
+```
+<out-root>/<dataset-name>/
+    preprocessing.json          <- modality, target spacing, normalization='per_case_zscore'
+    preprocessed_b2nd/
+        <image_id>.b2nd         <- one file per input image
+```
+
+The `preprocessing.json` sidecar records every knob needed to replay the same preprocessing at external-inference time. `cli.py` copies it into the training run's `Configs/` directory; `predict_external.py` reads it back from there. See [inference.md](inference.md) for the full flow.
+
 The MRI script mirrors `preprocess_ct.py` but with two key differences:
 
 - **No dataset-wide stats pass.** MRI has no absolute intensity reference (unlike CT's HU scale), so intensities are not comparable across scanners or sequences. Each case is z-scored independently on its own foreground.

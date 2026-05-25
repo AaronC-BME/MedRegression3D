@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 from contextlib import suppress
 from pathlib import Path
@@ -36,6 +37,35 @@ def _prepare_cfg(cfg):
             c for c in cfg.trainer.callbacks
             if c["_target_"] != "lightning.pytorch.callbacks.ModelCheckpoint"
         ]
+
+
+def _copy_preprocessing_sidecar(cfg):
+    """Copy `preprocessing.json` from the dataset dir into the run's `Configs/`.
+
+    The preprocess scripts (`preprocess_ct.py`, `preprocess_mri.py`) write a
+    `preprocessing.json` next to their `preprocessed_b2nd/` output folder.
+    Snapshotting it alongside `Configs/config.yaml` lets `predict_external.py`
+    later replay the exact same preprocessing on new NIfTI files.
+
+    Warn (but do not fail) if the sidecar is missing — preprocessed data created
+    before the sidecar landed still trains correctly; external prediction just
+    won't work for that run.
+    """
+    img_dir = Path(str(cfg.data.module.img_dir))
+    sidecar_src = img_dir.parent / "preprocessing.json"
+    if not sidecar_src.is_file():
+        print(
+            f"[warn] no preprocessing.json found at {sidecar_src} — "
+            "predict_external.py will not be able to replay this run's "
+            "preprocessing on new NIfTI files. Re-run preprocess_ct.py / "
+            "preprocess_mri.py to generate one."
+        )
+        return
+
+    dest_dir = Path(str(cfg.output_subdir))
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(sidecar_src, dest_dir / "preprocessing.json")
+    print(f"[info] copied preprocessing sidecar: {sidecar_src} -> {dest_dir / 'preprocessing.json'}")
 
 
 def _set_checkpoint_dir(cfg, base_name):
@@ -113,6 +143,10 @@ def _require_config_name():
 def _hydra_main(cfg):
     _prepare_cfg(cfg)
     print(OmegaConf.to_yaml(cfg))
+
+    # Snapshot the dataset's preprocessing.json into this run's Configs/ so
+    # predict_external.py can replay the same preprocessing on new NIfTI files.
+    _copy_preprocessing_sidecar(cfg)
 
     # `trainer.logger.name` is the source of truth for both the W&B run name
     # and the on-disk run folder. Capture the base before the fold loop so

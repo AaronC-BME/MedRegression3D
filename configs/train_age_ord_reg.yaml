@@ -42,7 +42,7 @@ data:
   module:
     _target_: medregression3d.data.datamodules.AgeReg_DataModule
     name: AgeOrdinalRegression          # Used in the on-disk output path and as the W&B project default
-    img_dir: <path_to_preprocessed_images>
+    img_dir: <path_to_dataset>/preprocessed_b2nd   # points at the .b2nd files; preprocessing.json sits one level up
     csv_file: <path_to_csv_file>
     label_column: label                 # CSV column holding the regression target
     batch_size: 4
@@ -63,7 +63,7 @@ data:
       do_dummy_2d_data_aug: False
 
   cv:
-    k: 5                                # 1 = single run, >1 = k-fold CV
+    k: 1                                # 1 = single run, >1 = k-fold CV
   num_classes: 100                      # Ordinal levels (e.g. 100 = ages 0..99). CORAL emits k-1 logits.
   patch_size: [160, 160, 160]
 
@@ -92,7 +92,7 @@ model:
   cifar_size: False
 
   # Pretrained init
-  pretrained: True
+  pretrained: False
   chpt_path: null                       # path to checkpoint when pretrained=True
 
   # Head + finetuning
@@ -112,8 +112,8 @@ model:
   # Scheduler
   scheduler: CosineAnneal               # CosineAnneal | Step | MultiStep | null
   T_max: ${trainer.max_epochs}
-  warmstart: 20
-  warmstart2: 20
+  warmstart: 0
+  warmstart2: 0
   epochs: ${trainer.max_epochs}
 
   # Regularization

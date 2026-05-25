@@ -4,7 +4,10 @@ A training run writes everything for one experiment to:
 
 ```
 <output_dir>/<dataset_name>/<trainer.logger.name>/
-├── Configs/                  <- Hydra config snapshot for the run
+├── Configs/
+│   ├── config.yaml           <- Hydra config snapshot for the run
+│   └── preprocessing.json    <- copied from the dataset's preprocessing.json
+│                                (see docs/inference.md for how this is used)
 └── folds/
     ├── 0/                    <- ModelCheckpoint files for fold 0
     ├── 1/                    <- fold 1, if running CV
