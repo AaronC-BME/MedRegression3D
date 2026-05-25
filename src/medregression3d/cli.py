@@ -1,4 +1,5 @@
 import os
+import sys
 from contextlib import suppress
 from pathlib import Path
 
@@ -84,8 +85,32 @@ CONFIG_DIR = os.path.abspath(
 )
 
 
-@hydra.main(version_base=None, config_path=CONFIG_DIR, config_name="train")
-def main(cfg):
+def _require_config_name():
+    """Each training run is driven by one self-contained configs/train_*.yaml,
+    selected with --config-name=<name>. Emit a friendly error listing the
+    available choices if the user forgot the flag."""
+    if any(
+        arg == "--config-name" or arg.startswith("--config-name=")
+        for arg in sys.argv[1:]
+    ):
+        return
+
+    configs = sorted(p.stem for p in Path(CONFIG_DIR).glob("train_*.yaml"))
+    choices = "\n  ".join(configs) if configs else "(none yet — create one in configs/)"
+    print(
+        "ERROR: --config-name is required.\n"
+        "\n"
+        "Launch with:\n"
+        "  python scripts/train.py --config-name=<name>\n"
+        "\n"
+        f"Available configs in {CONFIG_DIR}:\n  {choices}\n",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+@hydra.main(version_base=None, config_path=CONFIG_DIR, config_name=None)
+def _hydra_main(cfg):
     _prepare_cfg(cfg)
     print(OmegaConf.to_yaml(cfg))
 
@@ -122,7 +147,15 @@ def main(cfg):
         wandb.finish()
 
 
-if __name__ == "__main__":
+def main():
+    """Entry point used by both ``scripts/train.py`` and the ``medreg-train``
+    console script. Sets up env vars + OmegaConf resolvers, checks for
+    ``--config-name``, and delegates to the Hydra-wrapped runner."""
     os.environ["WANDB__SERVICE_WAIT"] = "300"
     make_omegaconf_resolvers()
+    _require_config_name()
+    _hydra_main()
+
+
+if __name__ == "__main__":
     main()
