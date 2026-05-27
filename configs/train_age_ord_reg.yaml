@@ -142,7 +142,7 @@ trainer:
 
   devices: 1
   accelerator: 'gpu'
-  strategy: 'ddp_find_unused_parameters_true'
+  strategy: 'auto'
   precision: '16-mixed'
   sync_batchnorm: True                  # auto-forced to True in cli.py when devices > 1
   benchmark: True
