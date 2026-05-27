@@ -5,7 +5,7 @@ For the command and argument reference, see the **Dataset preprocessing** sectio
 Output layout:
 
 ```
-<out-root>/<dataset-name>/
+<out-root>/
     preprocessing.json          <- modality, target spacing, normalization='per_case_zscore'
     preprocessed_b2nd/
         <image_id>.b2nd         <- one file per input image
@@ -23,7 +23,7 @@ The MRI script mirrors `preprocess_ct.py` but with two key differences:
 1. Resample to a target spacing. By default the script reads headers across every input image, takes the per-axis median spacing, and uses that. Override with `--target-spacing Z Y X`.
 2. Crop to the non-zero bounding box (typically trims a sizeable margin on skull-stripped MRI).
 3. Per-case z-score normalization on the foreground mask.
-4. Save as Blosc2 at `<out-root>/<dataset-name>/<image_id>.b2nd`.
+4. Save as Blosc2 at `<out-root>/preprocessed_b2nd/<image_id>.b2nd`.
 
 ## Alternative invocations
 
@@ -31,8 +31,7 @@ Force 1mm isotropic spacing:
 ```bash
 python scripts/preprocess_mri.py \
     --in-dir /path/to/raw/MRI/images \
-    --out-root /path/to/preprocessed_data \
-    --dataset-name Dataset017_OpenNeuro \
+    --out-root /path/to/dataset/Dataset017_OpenNeuro \
     --target-spacing 1 1 1 \
     --num-workers 8
 ```

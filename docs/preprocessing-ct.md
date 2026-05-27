@@ -5,7 +5,7 @@ For the command and argument reference, see the **Dataset preprocessing** sectio
 The CT script is dataset-agnostic and works on any CT dataset given one or more directories of `.nii.gz` images. Output layout:
 
 ```
-<out-root>/<dataset-name>/
+<out-root>/
     preprocessing.json          <- modality, target spacing, CT stats (mean/std/p0.5/p99.5)
     preprocessed_b2nd/
         <image_id>.b2nd         <- one file per input image
@@ -21,7 +21,7 @@ The `preprocessing.json` sidecar records every knob needed to replay the same pr
 1. Resample to a target spacing. By default the script reads headers across every input image, takes the per-axis median spacing, and uses that. Override with `--target-spacing Z Y X` to force a specific spacing (e.g. `1 1 1` for 1mm isotropic). Cases already at the target spacing skip resampling automatically.
 2. Crop to the non-zero bounding box (trims zero-padded edges; CT air at -1000 HU is preserved).
 3. CT-normalize: clip to the dataset-wide `[percentile_00_5, percentile_99_5]` range, then z-score using the dataset-wide mean and std.
-4. Save as Blosc2 at `<out-root>/<dataset-name>/<image_id>.b2nd`.
+4. Save as Blosc2 at `<out-root>/preprocessed_b2nd/<image_id>.b2nd`.
 
 ## Alternative invocations
 
@@ -29,8 +29,7 @@ Force 1mm isotropic spacing:
 ```bash
 python scripts/preprocess_ct.py \
     --in-dir /path/to/raw/CT/images \
-    --out-root /path/to/preprocessed_data \
-    --dataset-name Dataset001_LiverROI \
+    --out-root /path/to/dataset/Dataset001_LiverROI \
     --target-spacing 1 1 1 \
     --num-workers 8
 ```

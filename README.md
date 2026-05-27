@@ -35,8 +35,13 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv --python 3.11
 source .venv/bin/activate
 
-# Install the project (deps from pyproject.toml + medregression3d itself, editable).
-# PyTorch and torchvision are pulled in transitively.
+# Install PyTorch first. `--torch-backend=auto` detects your CUDA driver and
+# picks the matching wheel (e.g. cu124 / cu128). Falls back to CPU if no CUDA
+# is detected.
+uv pip install torch torchvision --torch-backend=auto
+
+# Install everything else (medregression3d + its remaining deps, editable).
+# torch/torchvision are already present, so uv keeps the wheels above.
 uv pip install -e .
 ```
 
@@ -57,7 +62,7 @@ Two preprocessing scripts, one per modality: [`scripts/preprocess_ct.py`](script
 Each script writes its output as:
 
 ```
-<out-root>/<dataset-name>/
+<out-root>/
     preprocessing.json          <- modality, target spacing, (CT) intensity stats
     preprocessed_b2nd/
         <image_id>.b2nd
@@ -74,26 +79,28 @@ The data module doesn't enforce a layout — it just needs `img_dir` (a folder o
 ```
 dataset/
 └── <data_name>/
-    ├── raw/                <- original .nii.gz files (kept for re-preprocessing)
-    ├── preprocessed/       <- .b2nd output from scripts/preprocess_ct.py / scripts/preprocess_mri.py
-    └── split_labels.csv    <- splits/labels/folds CSV
+    ├── raw/                    <- original .nii.gz files (kept for re-preprocessing)
+    ├── preprocessing.json      <- written by scripts/preprocess_ct.py / scripts/preprocess_mri.py
+    ├── preprocessed_b2nd/      <- .b2nd output from those same scripts
+    │   └── <image_id>.b2nd
+    └── split_labels.csv        <- splits/labels/folds CSV
 ```
+
+Point the preprocess scripts' `--out-root` at `dataset/<data_name>/`, and your training config's `data.module.img_dir` at `dataset/<data_name>/preprocessed_b2nd/`.
 
 ## CT
 
 ```bash
 python scripts/preprocess_ct.py \
     --in-dir /path/to/raw/CT/imagesTr /path/to/raw/CT/imagesVal \
-    --out-root /path/to/preprocessed_data \
-    --dataset-name Dataset001_LiverROI \
+    --out-root /path/to/dataset/Dataset001_LiverROI \
     --num-workers 8
 ```
 
 | Flag | Description |
 |---|---|
 | `--in-dir` | One or more directories of raw `.nii.gz` CT images. Stats and median spacing span all of them. |
-| `--out-root` | Output root. The script writes to `<out-root>/<dataset-name>/<image_id>.b2nd`. |
-| `--dataset-name` | Name of the dataset folder (e.g. `Dataset001_LiverROI`). |
+| `--out-root` | Output directory for this dataset. The script writes `<out-root>/preprocessed_b2nd/<image_id>.b2nd` and `<out-root>/preprocessing.json`. |
 | `--target-spacing Z Y X` | Target voxel spacing in mm. **Optional.** If omitted, defaults to the per-axis median spacing across all input images. |
 | `--skip-resample` | Skip the resampling step entirely (use native spacing). |
 | `--num-workers` | Parallel processes for the stats / spacing / per-case passes. Default `8`. |
@@ -104,16 +111,14 @@ python scripts/preprocess_ct.py \
 ```bash
 python scripts/preprocess_mri.py \
     --in-dir /path/to/raw/MRI/imagesTr /path/to/raw/MRI/imagesVal \
-    --out-root /path/to/preprocessed_data \
-    --dataset-name Dataset017_OpenNeuro \
+    --out-root /path/to/dataset/Dataset017_OpenNeuro \
     --num-workers 8
 ```
 
 | Flag | Description |
 |---|---|
 | `--in-dir` | One or more directories of raw `.nii.gz` MR images. Median spacing spans all of them. |
-| `--out-root` | Output root. The script writes to `<out-root>/<dataset-name>/<image_id>.b2nd`. |
-| `--dataset-name` | Name of the dataset folder (e.g. `Dataset017_OpenNeuro`). |
+| `--out-root` | Output directory for this dataset. The script writes `<out-root>/preprocessed_b2nd/<image_id>.b2nd` and `<out-root>/preprocessing.json`. |
 | `--target-spacing Z Y X` | Target voxel spacing in mm. **Optional.** If omitted, defaults to the per-axis median spacing across all input images. |
 | `--skip-resample` | Skip the resampling step entirely. |
 | `--num-workers` | Parallel processes. Default `8`. |

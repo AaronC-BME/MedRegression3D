@@ -7,7 +7,7 @@ If your dataset can be described as "a directory of preprocessed `.b2nd` files p
 1. **Preprocess your data** with `scripts/preprocess_ct.py` or `scripts/preprocess_mri.py`. The output layout is:
 
    ```
-   <out-root>/<dataset-name>/
+   <out-root>/
        preprocessing.json      <- needed by predict_external.py later; cli.py auto-copies it into runs
        preprocessed_b2nd/
            <image_id>.b2nd
@@ -26,7 +26,7 @@ If your dataset can be described as "a directory of preprocessed `.b2nd` files p
      module:
        _target_: medregression3d.data.datamodules.AgeReg_DataModule
        name: YourDatasetName
-       img_dir: /path/to/<out-root>/<dataset-name>/preprocessed_b2nd   # points at the b2nd files
+       img_dir: /path/to/<out-root>/preprocessed_b2nd   # points at the b2nd files
        csv_file: /path/to/splits_labels.csv
        label_column: label                  # or "age", etc.
        batch_size: 4

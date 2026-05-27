@@ -15,11 +15,11 @@ For external inference to be valid, the preprocessing applied at inference time 
 
 ```
 preprocess_{ct,mri}.py
-   writes  ──►  <out_root>/<dataset>/preprocessing.json
-                <out_root>/<dataset>/preprocessed_b2nd/*.b2nd
+   writes  ──►  <out_root>/preprocessing.json
+                <out_root>/preprocessed_b2nd/*.b2nd
 
 train.py
-   reads  ──►   <dataset>/preprocessing.json   (next to img_dir)
+   reads  ──►   <out_root>/preprocessing.json   (next to img_dir)
    copies ──►   <run_dir>/Configs/preprocessing.json   (alongside config.yaml)
 
 predict_external.py

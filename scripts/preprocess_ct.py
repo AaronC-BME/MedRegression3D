@@ -9,7 +9,7 @@ foreground (HU > -500), then for each case:
   3. Applies CT normalization (clip to dataset percentiles + dataset z-score).
   4. Saves as Blosc2 in this layout:
 
-        <out_root>/<dataset-name>/
+        <out_root>/
             preprocessing.json          <- modality, target spacing, dataset stats
             preprocessed_b2nd/
                 <id>.b2nd               <- one file per input image
@@ -20,7 +20,8 @@ also copies it into each training run's `Configs/` dir so the run is
 self-describing.
 
 Notes:
-  - This script is dataset-agnostic. Use --dataset-name to set the folder.
+  - This script is dataset-agnostic. Point --out-root at whatever directory
+    you want to hold the preprocessed dataset (e.g. .../<your_dataset>/).
   - --in-dir accepts one or more directories. All .nii.gz files across all
     directories are processed into the same output folder, and dataset stats
     + median target spacing (when auto-computed) are taken across all of them.
@@ -39,8 +40,7 @@ Notes:
 Usage:
     python preprocess_ct.py \\
         --in-dir <dir_1> [<dir_2> ...] \\
-        --out-root <path_to_output_root> \\
-        --dataset-name <dataset_name> \\
+        --out-root <path_to_output_dir> \\
         --num-workers 8
 """
 import sys
@@ -241,11 +241,9 @@ def main() -> None:
     parser.add_argument("--in-dir", required=True, type=Path, nargs="+",
                         help="One or more directories containing raw .nii.gz CT images.")
     parser.add_argument("--out-root", required=True, type=Path,
-                        help="Output root. The script writes to "
-                             "<out-root>/<dataset-name>/preprocessed_b2nd/<id>.b2nd "
-                             "and <out-root>/<dataset-name>/preprocessing.json")
-    parser.add_argument("--dataset-name", required=True, type=str,
-                        help="Name of the dataset folder, e.g. Dataset001_LiverROI.")
+                        help="Output directory for this dataset. The script writes to "
+                             "<out-root>/preprocessed_b2nd/<id>.b2nd and "
+                             "<out-root>/preprocessing.json")
     parser.add_argument("--target-spacing", type=float, nargs=3,
                         default=None, metavar=("Z", "Y", "X"),
                         help="Target spacing in mm as three floats: Z Y X. "
@@ -317,7 +315,7 @@ def main() -> None:
             print(f"  {k:>20s}: {v:.4f}")
 
     # ---- Build per-case output paths and dispatch ---- #
-    dataset_dir = args.out_root / args.dataset_name
+    dataset_dir = args.out_root
     b2nd_dir = dataset_dir / "preprocessed_b2nd"
     b2nd_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nWriting outputs to {b2nd_dir}/<id>.b2nd")
