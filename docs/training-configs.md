@@ -78,6 +78,17 @@ model:
 
 No new config file needed.
 
+## Encoder depth (`model.n_stages`)
+
+The `ResEncoder` adapts its depth and per-axis strides to `data.patch_size`:
+
+- `model.n_stages: null` (auto) — the encoder picks how many `[2,2,2]` downsampling stages fit the patch, stopping when the most-constrained axis can no longer be halved.
+- `model.n_stages: <int>` — forces that many stages; axes that run out of factors of 2 drop to stride 1 (e.g. `[2,2,1]`).
+
+With `model.pretrained: True` the value **must** be `6` (or `null`) — the nnSSL ResEnc-L checkpoint only matches the original 6-stage topology, and any other value raises an error. Custom depths require `pretrained: False`.
+
+The resolved geometry is printed to the training log and saved to each run's `Configs/model_architecture.txt`. See [encoder-stages.md](encoder-stages.md) for the full rules, the divisibility relationship to patch size, and worked examples.
+
 ## Adding your own experiment
 
 Copy an existing template to `configs/train_<your_name>.yaml`, edit the placeholders, and launch with `--config-name=train_<your_name>`. See [custom-datasets.md](custom-datasets.md) for the full step-by-step.

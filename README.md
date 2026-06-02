@@ -18,6 +18,7 @@ The main differences from upstream:
 | CT preprocessing — pipeline details | [docs/preprocessing-ct.md](docs/preprocessing-ct.md) |
 | MRI preprocessing — pipeline details | [docs/preprocessing-mri.md](docs/preprocessing-mri.md) |
 | Training configs — what each `train_*.yaml` does | [docs/training-configs.md](docs/training-configs.md) |
+| Encoder depth / stages & patch size (`model.n_stages`) | [docs/encoder-stages.md](docs/encoder-stages.md) |
 | Adding your own dataset | [docs/custom-datasets.md](docs/custom-datasets.md) |
 | Task choice and loss function options | [docs/tasks-and-losses.md](docs/tasks-and-losses.md) |
 | Output directory layout and run naming | [docs/output-layout.md](docs/output-layout.md) |
@@ -57,7 +58,7 @@ You should see your torch version, `cuda: True`, and a non-zero device count if 
 
 # Dataset preprocessing
 
-Two preprocessing scripts, one per modality: [`scripts/preprocess_ct.py`](scripts/preprocess_ct.py) for CT and [`scripts/preprocess_mri.py`](scripts/preprocess_mri.py) for MRI. Both take one or more directories of `.nii.gz` images, resample to a target spacing (defaults to the per-axis median across the input dataset), crop to the non-zero bounding box, normalize, and save as Blosc2 (`.b2nd`). Center 160³ patches are extracted at training time, not during preprocessing.
+Two preprocessing scripts, one per modality: [`scripts/preprocess_ct.py`](scripts/preprocess_ct.py) for CT and [`scripts/preprocess_mri.py`](scripts/preprocess_mri.py) for MRI. Both take one or more directories of `.nii.gz` images, resample to a target spacing (defaults to the per-axis median across the input dataset), crop to the non-zero bounding box, normalize, and save as Blosc2 (`.b2nd`). Patches are extracted at training time (not during preprocessing); their size is set by `data.patch_size` in the config, and the encoder adapts its depth/strides to that patch size — see [docs/encoder-stages.md](docs/encoder-stages.md).
 
 Each script writes its output as:
 

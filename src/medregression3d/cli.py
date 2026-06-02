@@ -68,6 +68,46 @@ def _copy_preprocessing_sidecar(cfg):
     print(f"[info] copied preprocessing sidecar: {sidecar_src} -> {dest_dir / 'preprocessing.json'}")
 
 
+def _save_model_architecture(model, configs_dir):
+    """Dump the resolved architecture next to the run's config.yaml.
+
+    Hydra already snapshots config.yaml (with the *requested* n_stages, which may
+    be null/auto). This records what was actually built — resolved depth, strides,
+    channel widths, parameter counts, and the full module tree — so a run is fully
+    reproducible even when the encoder geometry was inferred from the patch size.
+    """
+    configs_dir = Path(configs_dir)
+    configs_dir.mkdir(parents=True, exist_ok=True)
+
+    lines = []
+    enc = getattr(model, "encoder", None)
+    if enc is not None:
+        lines += [
+            "# Resolved encoder geometry",
+            f"n_stages:           {getattr(enc, 'n_stages', '?')}",
+            f"strides:            {getattr(enc, 'strides', '?')}",
+            f"features_per_stage: {getattr(enc, 'features_per_stage', '?')}",
+            f"embed_dim (head):   {getattr(enc, 'output_channels', '?')}",
+            "",
+        ]
+
+    n_params = sum(p.numel() for p in model.parameters())
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    lines += [
+        "# Parameters",
+        f"total:     {n_params:,}",
+        f"trainable: {n_train:,}",
+        "",
+        "# Full module tree",
+        str(model),
+        "",
+    ]
+
+    out_path = configs_dir / "model_architecture.txt"
+    out_path.write_text("\n".join(lines))
+    print(f"[info] saved model architecture -> {out_path}")
+
+
 def _set_checkpoint_dir(cfg, base_name):
     """Point ModelCheckpoint at <output_dir>/<dataset>/<base_name>/folds/<fold>."""
     if not cfg.trainer["enable_checkpointing"]:
@@ -153,6 +193,10 @@ def _hydra_main(cfg):
     # all folds share one parent dir even though their W&B names differ.
     base_name = cfg.trainer.logger.name
 
+    # Capture the run's Configs/ dir while logger.name still == base_name (it gets
+    # mutated per-fold below). This is where Hydra wrote config.yaml.
+    configs_dir = str(cfg.output_subdir)
+
     for k in range(cfg.data.cv.k):
         if cfg.data.cv.k > 1:
             cfg.data.module.fold = k
@@ -166,6 +210,11 @@ def _hydra_main(cfg):
 
         trainer = instantiate(cfg.trainer)
         model = instantiate(cfg.model)
+
+        # Snapshot the resolved architecture once (identical across folds), before
+        # torch.compile wraps the module and obscures its repr.
+        if k == 0:
+            _save_model_architecture(model, configs_dir)
 
         if cfg.model.compile:
             model = torch.compile(model, mode="default")
