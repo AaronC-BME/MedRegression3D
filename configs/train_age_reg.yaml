@@ -10,25 +10,9 @@
 #   - data.module.name     : AgeRegression  (used in output paths / W&B project)
 # Everything else mirrors the ordinal-regression config for an apples-to-apples
 # comparison run.
+#
+# Section order: Data -> Model -> Trainer -> Output/run misc.
 # =============================================================================
-
-# ---- Output ----------------------------------------------------------------
-output_dir: ${oc.env:EXPERIMENT_LOCATION,"<path_to_output>"}
-output_subdir: ${output_dir}/${data.module.name}/${trainer.logger.name}/Configs
-hydra:
-  output_subdir: ${output_subdir}
-  job:
-    chdir: False
-  run:
-    dir: .
-
-# ---- Run misc --------------------------------------------------------------
-seed: False
-val_only: False
-
-metrics:
-  - 'mae'
-  - 'mse'
 
 # ============================================================================
 # Data
@@ -75,6 +59,11 @@ model:
   input_dim: 3
   input_channels: 1
   input_shape: ${data.patch_size}
+  # Encoder depth. null -> auto: stem [1,1,1] then [2,2,2] until the most-
+  # constrained axis can't be halved. An int forces that many stages, dropping
+  # per-axis strides to 1 where an axis runs out (e.g. [2,2,1]). Must be 6 (or
+  # null) when pretrained=True, since the ResEnc-L checkpoint is 6 stages.
+  n_stages: null
   num_classes: ${data.num_classes}
   cifar_size: False
 
@@ -160,3 +149,22 @@ trainer:
     offline: False
     project: <wandb_project_name>
     name: <wandb_run_name>
+
+# ============================================================================
+# Output + run misc
+# ============================================================================
+output_dir: ${oc.env:EXPERIMENT_LOCATION,"<path_to_output>"}
+output_subdir: ${output_dir}/${data.module.name}/${trainer.logger.name}/Configs
+hydra:
+  output_subdir: ${output_subdir}
+  job:
+    chdir: False
+  run:
+    dir: .
+
+seed: False
+val_only: False
+
+metrics:
+  - 'mae'
+  - 'mse'

@@ -98,13 +98,6 @@ Copy an existing template to `configs/train_<your_name>.yaml`, edit the placehol
 Every `train_*.yaml` is organized as:
 
 ```yaml
-# Top-level: output paths, hydra meta, run misc, metrics
-output_dir: ...
-hydra: { ... }
-seed: False
-val_only: False
-metrics: [ ... ]
-
 # Data: datamodule, transforms, CV, num_classes, patch_size
 data:
   module: { _target_, name, img_dir, csv_file, label_column, batch_size, ... }
@@ -126,6 +119,13 @@ trainer:
   devices: ...
   callbacks: { ... }
   logger: { ... }
+
+# Output + run misc: output paths, hydra meta, seed/val_only, metrics
+output_dir: ...
+hydra: { ... }
+seed: False
+val_only: False
+metrics: [ ... ]
 ```
 
 Any key can be overridden on the CLI with dotted-path syntax (`model.lr=5e-4`, `trainer.devices=2`, `data.module.batch_size=8`).
