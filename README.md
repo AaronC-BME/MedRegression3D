@@ -1,28 +1,10 @@
-# 3D medical image regression and ordinal regression repository
-<sub>Copyright German Cancer Research Center (DKFZ) and contributors. Please make sure that your usage of this code is in compliance with its license.<sub>
+# 3D Medical Image Regression
 
-This repository extends and builds on [constantinulrich/SSL3D_classification](https://github.com/constantinulrich/SSL3D_classification), refocused on **regression** and **ordinal regression** tasks. The upstream repository in turn builds on the [IMAGE CLASSIFICATION FRAMEWORK BY HELMHOLTZ IMAGING](https://github.com/MIC-DKFZ/image_classification) and supports fine-tuning checkpoints from [nnssl](https://github.com/MIC-DKFZ/nnssl).
+This repository provides an easy-to-use pipeline for 3D medical image regression with three key features:
+- support regression and ordinal regression (CORAL) tasks
+- fine-tune foundation models
+- multiple ordinal loss functions (focal, top-k, weighted BCE, BCE+MAE, etc.)
 
-The main differences from upstream:
-- A `Regression` task with MSE loss.
-- An `Ordinal_Regression` task using the [CORAL](https://arxiv.org/abs/1901.07884) formulation, with several alternative ordinal losses (focal, top-k, weighted BCE, BCE+MAE, etc.) selectable via a `loss_fn` config field.
-- Model variants: `ResEncoder_Regressor` (plain regression head), `ResEncoder_OrdinalRegressor` (CORAL-style head), and `ResEncoder_OrdinalRegressor_MLP` (CORAL head with an MLP projection).
-- Two inference scripts: `scripts/predict_test.py` re-runs val + test from the training CSV (with metrics + age-bin reports); `scripts/predict_external.py` runs the trained model on a directory of raw `.nii.gz` files, replaying the training-time preprocessing on the fly.
-- The original `Classification` task and its associated models/losses/metrics have been removed.
-
-## Documentation
-
-| Topic | File |
-|---|---|
-| CSV schema for splits / labels / folds | [docs/data-csv-format.md](docs/data-csv-format.md) |
-| CT preprocessing — pipeline details | [docs/preprocessing-ct.md](docs/preprocessing-ct.md) |
-| MRI preprocessing — pipeline details | [docs/preprocessing-mri.md](docs/preprocessing-mri.md) |
-| Training configs — what each `train_*.yaml` does | [docs/training-configs.md](docs/training-configs.md) |
-| Encoder depth / stages & patch size (`model.n_stages`) | [docs/encoder-stages.md](docs/encoder-stages.md) |
-| Adding your own dataset | [docs/custom-datasets.md](docs/custom-datasets.md) |
-| Task choice and loss function options | [docs/tasks-and-losses.md](docs/tasks-and-losses.md) |
-| Output directory layout and run naming | [docs/output-layout.md](docs/output-layout.md) |
-| Inference — `predict_test.py` (held-out splits) & `predict_external.py` (raw NIfTI) | [docs/inference.md](docs/inference.md) |
 
 # Installation
 
@@ -36,29 +18,17 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv --python 3.11
 source .venv/bin/activate
 
-# Install PyTorch first. `--torch-backend=auto` detects your CUDA driver and
-# picks the matching wheel (e.g. cu124 / cu128). Falls back to CPU if no CUDA
-# is detected.
 uv pip install torch torchvision --torch-backend=auto
+# Verifying the install
+python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available(), 'devices:', torch.cuda.device_count())"
+# You should see your torch version, `cuda: True`, and a non-zero device count if you have a GPU available.
 
-# Install everything else (medregression3d + its remaining deps, editable).
-# torch/torchvision are already present, so uv keeps the wheels above.
 uv pip install -e .
 ```
 
-To deactivate the env later, run `deactivate`. To resume work, `cd` into the repo and `source .venv/bin/activate` again.
-
-## Verifying the install
-
-```shell
-python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available(), 'devices:', torch.cuda.device_count())"
-```
-
-You should see your torch version, `cuda: True`, and a non-zero device count if you have a GPU available.
-
 # Dataset preprocessing
 
-Two preprocessing scripts, one per modality: [`scripts/preprocess_ct.py`](scripts/preprocess_ct.py) for CT and [`scripts/preprocess_mri.py`](scripts/preprocess_mri.py) for MRI. Both take one or more directories of `.nii.gz` images, resample to a target spacing (defaults to the per-axis median across the input dataset), crop to the non-zero bounding box, normalize, and save as Blosc2 (`.b2nd`). Patches are extracted at training time (not during preprocessing); their size is set by `data.patch_size` in the config, and the encoder adapts its depth/strides to that patch size — see [docs/encoder-stages.md](docs/encoder-stages.md).
+Two preprocessing scripts, one per modality: [`scripts/preprocess_ct.py`](scripts/preprocess_ct.py) for CT and [`scripts/preprocess_mri.py`](scripts/preprocess_mri.py) for MRI. Both take one or more directories of `.nii.gz` images, resample to a target spacing (defaults to the per-axis median across the input dataset), crop to the non-zero bounding box, normalize, and save as Blosc2 (`.b2nd`). Patches are extracted at training time, not during preprocessing; their size is set by `data.patch_size` in the config, and the encoder adapts its depth/strides to that patch size.
 
 Each script writes its output as:
 
@@ -89,7 +59,7 @@ dataset/
 
 Point the preprocess scripts' `--out-root` at `dataset/<data_name>/`, and your training config's `data.module.img_dir` at `dataset/<data_name>/preprocessed_b2nd/`.
 
-## CT
+### CT
 
 ```bash
 python scripts/preprocess_ct.py \
@@ -107,7 +77,7 @@ python scripts/preprocess_ct.py \
 | `--num-workers` | Parallel processes for the stats / spacing / per-case passes. Default `8`. |
 | `--stats-mean / --stats-std / --stats-pct-00-5 / --stats-pct-99-5` | Optional pre-supplied stats; bypasses the dataset-wide stats pass. All four must be set together. |
 
-## MRI
+### MRI
 
 ```bash
 python scripts/preprocess_mri.py \
@@ -140,10 +110,10 @@ If you forget the flag, `train.py` prints a friendly error listing the available
 
 | Config | Task | Notes |
 |---|---|---|
-| `train_age_ord_reg` | `Ordinal_Regression` (CORAL) | Template. Has `<placeholder>` paths to fill in — copy this for a new ordinal-regression experiment. |
-| `train_age_reg` | `Regression` (MSE) | Template for plain regression. |
+| `train_age_reg` | `Regression` (MSE) | Template for plain regression. Set paths, `project`, `name`. Copy this for a new regression experiment. |
+| `train_age_ord_reg` | `Ordinal_Regression` (CORAL) | Template for ordinal regression. Set `num_classes`, paths, `loss_fn`. Copy this for a new ordinal-regression experiment. |
 
-See [docs/training-configs.md](docs/training-configs.md) for what each config sets up and when to pick which.
+See [docs/training-configs.md](docs/training-configs.md) for the config layout and which knobs matter when, and [docs/tasks-and-losses.md](docs/tasks-and-losses.md) for the `task` / `loss_fn` options.
 
 ## Examples
 
@@ -172,21 +142,12 @@ python scripts/train.py --config-name=train_age_ord_reg \
 
 ## Adding a new experiment
 
-Copy an existing `configs/train_*.yaml` to `configs/train_<your_name>.yaml`, edit the placeholders (img_dir, csv_file, project, name), then `python scripts/train.py --config-name=train_<your_name>`. See [docs/custom-datasets.md](docs/custom-datasets.md) for the full workflow, and [docs/tasks-and-losses.md](docs/tasks-and-losses.md) for the `task` / `loss_fn` options. [docs/output-layout.md](docs/output-layout.md) explains where runs land on disk.
+Copy an existing `configs/train_*.yaml` to `configs/train_<your_name>.yaml`, edit the placeholders (`img_dir`, `csv_file`, `num_classes`, project, name), then `python scripts/train.py --config-name=train_<your_name>`. See [docs/custom-datasets.md](docs/custom-datasets.md) for the full workflow, and [docs/tasks-and-losses.md](docs/tasks-and-losses.md) for the `task` / `loss_fn` options. [docs/output-layout.md](docs/output-layout.md) explains where runs land on disk.
 
 For running inference on a trained model, see [docs/inference.md](docs/inference.md).
 
 ---
 
-**If you use this codebase, please cite:**
-```
-   @misc{Openmind,
-   title={An OpenMind for 3D medical vision self-supervised learning},
-   author={Tassilo Wald and Constantin Ulrich and Jonathan Suprijadi and Sebastian Ziegler and Michal Nohel and Robin Peretzke and Gregor Köhler and Klaus H. Maier-Hein},
-   year={2025},
-   eprint={2412.17041},
-   archivePrefix={arXiv},
-   primaryClass={cs.CV},
-   url={https://arxiv.org/abs/2412.17041},
-   }
-```
+## Acknowledgement
+
+This codebase is adapted from [SSL3D_classification](https://github.com/constantinulrich/SSL3D_classification) and [nnSSL](https://github.com/MIC-DKFZ/nnssl).
